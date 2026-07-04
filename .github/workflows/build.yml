@@ -1,0 +1,60 @@
+name: Build Mythic (32-bit Win32)
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch: # يتيح تشغيل البناء يدوياً من موقع GitHub
+
+jobs:
+  build:
+    name: Build Mythic.exe
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Add MSBuild to PATH
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Setup NuGet
+      uses: NuGet/setup-nuget@v2
+
+    - name: Restore NuGet Packages
+      run: nuget restore SystemInformer.sln
+
+    - name: Initialize Thirdparty and Tools
+      run: |
+        call build\build_init.cmd INIT
+      shell: cmd
+
+    - name: Build Mythic (Win32 Debug)
+      run: |
+        msbuild SystemInformer.sln /t:SystemInformer /p:Configuration=Debug /p:Platform=Win32 /p:TargetName=Mythic /m /v:minimal /nologo
+      shell: cmd
+
+    - name: Verify Output
+      run: |
+        if not exist "bin\Debug32\Mythic.exe" (
+          echo [ERROR] Mythic.exe was not built!
+          exit /b 1
+        )
+        echo [SUCCESS] Mythic.exe built successfully.
+      shell: cmd
+
+    - name: Upload Mythic.exe Build Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: Mythic-Win32-Debug
+        path: |
+          bin/Debug32/Mythic.exe
+          bin/Debug32/Mythic.pdb
+          bin/Debug32/plugins/
+        if-no-files-found: error
+        retention-days: 7
