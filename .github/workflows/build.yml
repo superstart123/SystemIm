@@ -7,7 +7,7 @@ on:
   pull_request:
     branches:
       - main
-  workflow_dispatch: # يتيح تشغيل البناء يدوياً من موقع GitHub
+  workflow_dispatch:
 
 jobs:
   build:
@@ -34,20 +34,83 @@ jobs:
         call build\build_init.cmd INIT
       shell: cmd
 
+    # ============================================
+    # 🛠️ إصلاح مشكلة winternl.h
+    # ============================================
+    - name: Fix nativeprocess.c - Remove winternl.h conflict
+      run: |
+        echo Fixing nativeprocess.c...
+        
+        :: إنشاء نسخة احتياطية
+        copy phlib\nativeprocess.c phlib\nativeprocess.c.backup
+        
+        :: إزالة #include <winternl.h> وإضافة تعريف الدالة
+        powershell -Command "$content = Get-Content phlib\nativeprocess.c -Raw; $content = $content -replace '#include <winternl.h>', ''; $content = $content -replace '#include <kphuser.h>', '#include <kphuser.h>`n`n// ===== تعريف RtlLookupPrivilegeValue =====`nNTSTATUS NTAPI RtlLookupPrivilegeValue(`n    _In_opt_ PCWSTR lpSystemName,`n    _In_ PCWSTR lpName,`n    _Out_ PLUID lpLuid`n);`n// ========================================='; $content | Set-Content phlib\nativeprocess.c"
+        
+        echo Fixed nativeprocess.c!
+      shell: cmd
+
+    # ============================================
+    # 🛠️ إصلاح مشكلة المكتبة (kphlib_um.lib)
+    # ============================================
+    - name: Fix Library Name (Mythic.lib -> kphlib_um.lib)
+      run: |
+        echo Fixing library name...
+        
+        :: بناء kphlib أولاً للتأكد من وجود Mythic.lib
+        msbuild kphlib\kphlib_um.vcxproj /p:Configuration=Debug /p:Platform=Win32 /v:minimal /nologo
+        
+        :: نسخ Mythic.lib إلى kphlib_um.lib
+        if exist kphlib\bin\Debug32\Mythic.lib (
+            copy kphlib\bin\Debug32\Mythic.lib kphlib\bin\Debug32\kphlib_um.lib
+            echo Created kphlib_um.lib
+        ) else (
+            echo ERROR: Mythic.lib not found!
+            dir kphlib\bin\Debug32\
+            exit /b 1
+        )
+        
+        :: تعديل phlib.vcxproj لاستخدام Mythic.lib
+        powershell -Command "$content = Get-Content phlib\phlib.vcxproj -Raw; $content = $content -replace 'kphlib_um.lib', 'Mythic.lib'; $content | Set-Content phlib\phlib.vcxproj"
+        
+        echo Library fix completed!
+      shell: cmd
+
+    # ============================================
+    # 🏗️ بناء المشروع الرئيسي
+    # ============================================
     - name: Build Mythic (Win32 Debug)
       run: |
+        echo ============================================
+        echo Building Mythic.exe...
+        echo ============================================
         msbuild SystemInformer.sln /t:SystemInformer /p:Configuration=Debug /p:Platform=Win32 /p:TargetName=Mythic /m /v:minimal /nologo
       shell: cmd
 
+    # ============================================
+    # ✅ التحقق من نجاح البناء
+    # ============================================
     - name: Verify Output
       run: |
-        if not exist "bin\Debug32\Mythic.exe" (
-          echo [ERROR] Mythic.exe was not built!
-          exit /b 1
+        echo ============================================
+        echo Verifying build output...
+        echo ============================================
+        
+        if exist "bin\Debug32\Mythic.exe" (
+            echo [SUCCESS] Mythic.exe built successfully!
+            echo File size: 
+            dir bin\Debug32\Mythic.exe
+        ) else (
+            echo [ERROR] Mythic.exe was not built!
+            echo Searching for Mythic.exe...
+            dir /s /b *.exe
+            exit /b 1
         )
-        echo [SUCCESS] Mythic.exe built successfully.
       shell: cmd
 
+    # ============================================
+    # 📤 رفع الملفات
+    # ============================================
     - name: Upload Mythic.exe Build Artifact
       uses: actions/upload-artifact@v4
       with:
@@ -55,6 +118,22 @@ jobs:
         path: |
           bin/Debug32/Mythic.exe
           bin/Debug32/Mythic.pdb
-          bin/Debug32/plugins/
+          bin/Debug32/*.dll
+          bin/Debug32/*.pdb
         if-no-files-found: error
         retention-days: 7
+
+    # ============================================
+    # 📊 ملخص البناء
+    # ============================================
+    - name: Build Summary
+      if: always()
+      run: |
+        echo ============================================
+        echo 📊 BUILD SUMMARY
+        echo ============================================
+        echo Status: ${{ job.status }}
+        echo Artifact: Mythic-Win32-Debug
+        echo Retention: 7 days
+        echo ============================================
+      shell: cmd
