@@ -29,10 +29,15 @@ jobs:
     - name: Restore NuGet Packages
       run: nuget restore SystemInformer.sln
 
+    - name: Initialize Thirdparty and Tools
+      run: |
+        call build\build_init.cmd INIT
+      shell: cmd
+
     # ============================================
-    # 🛠️ إصلاح nativeprocess.c
+    # 🛠️ الإصلاح الوحيد المطلوب
     # ============================================
-    - name: Fix nativeprocess.c
+    - name: Fix nativeprocess.c - Remove winternl.h
       run: |
         echo Fixing nativeprocess.c...
         powershell -Command "$content = Get-Content phlib\nativeprocess.c -Raw; $content = $content -replace '#include <winternl.h>', ''; $content = $content -replace '#include <kphuser.h>', '#include <kphuser.h>`n`n// ===== تعريف RtlLookupPrivilegeValue =====`nNTSTATUS NTAPI RtlLookupPrivilegeValue(`n    _In_opt_ PCWSTR lpSystemName,`n    _In_ PCWSTR lpName,`n    _Out_ PLUID lpLuid`n);`n// ========================================='; $content | Set-Content phlib\nativeprocess.c"
@@ -40,88 +45,25 @@ jobs:
       shell: cmd
 
     # ============================================
-    # 🔧 إصلاح build_dyndata.cmd
-    # ============================================
-    - name: Fix build_dyndata.cmd
-      run: |
-        echo Fixing build_dyndata.cmd...
-        
-        :: إنشاء المجلد إذا لم يكن موجوداً
-        if not exist "kphlib\bin\Debug32" mkdir "kphlib\bin\Debug32"
-        
-        :: إنشاء ملفات فارغة لتجنب أخطاء البناء
-        echo. > kphlib\bin\Debug32\ksidyn.bin
-        echo. > kphlib\include\kphdyn.h
-        echo. > kphlib\kphdyn.c
-        
-        echo Fixed build_dyndata.cmd!
-      shell: cmd
-
-    # ============================================
-    # 🏗️ بناء kphlib أولاً
-    # ============================================
-    - name: Build kphlib_um
-      run: |
-        echo Building kphlib_um...
-        msbuild kphlib\kphlib_um.vcxproj /p:Configuration=Debug /p:Platform=Win32 /v:minimal /nologo
-      shell: cmd
-
-    # ============================================
-    # 🛠️ إصلاح مشكلة المكتبة
-    # ============================================
-    - name: Fix Library Name
-      run: |
-        echo Fixing library name...
-        
-        :: البحث عن Mythic.lib
-        for /r kphlib %%f in (Mythic.lib) do (
-            echo Found: %%f
-            copy "%%f" "%%~dpfkphlib_um.lib"
-        )
-        
-        :: إذا لم يتم العثور عليه، جرب مساراً آخر
-        if exist "kphlib\bin\Debug32\Mythic.lib" (
-            copy "kphlib\bin\Debug32\Mythic.lib" "kphlib\bin\Debug32\kphlib_um.lib"
-            echo Created kphlib_um.lib
-        ) else (
-            echo WARNING: Mythic.lib not found, creating placeholder...
-            echo. > kphlib\bin\Debug32\kphlib_um.lib
-        )
-        
-        :: تعديل phlib.vcxproj
-        powershell -Command "$content = Get-Content phlib\phlib.vcxproj -Raw; $content = $content -replace 'kphlib_um.lib', 'Mythic.lib'; $content | Set-Content phlib\phlib.vcxproj"
-        
-        echo Library fix completed!
-      shell: cmd
-
-    # ============================================
-    # 🏗️ بناء المشروع الرئيسي
+    # 🏗️ بناء المشروع
     # ============================================
     - name: Build Mythic (Win32 Debug)
       run: |
-        echo ============================================
         echo Building Mythic.exe...
-        echo ============================================
         msbuild SystemInformer.sln /t:SystemInformer /p:Configuration=Debug /p:Platform=Win32 /p:TargetName=Mythic /m /v:minimal /nologo
       shell: cmd
 
     # ============================================
-    # ✅ التحقق من نجاح البناء
+    # ✅ التحقق
     # ============================================
     - name: Verify Output
       run: |
-        echo ============================================
-        echo Verifying build output...
-        echo ============================================
-        
         if exist "bin\Debug32\Mythic.exe" (
-            echo [SUCCESS] Mythic.exe built successfully!
-            dir bin\Debug32\Mythic.exe
+          echo [SUCCESS] Mythic.exe built successfully!
+          dir bin\Debug32\Mythic.exe
         ) else (
-            echo [ERROR] Mythic.exe was not built!
-            echo Searching for Mythic.exe...
-            dir /s /b *.exe
-            exit /b 1
+          echo [ERROR] Mythic.exe was not built!
+          exit /b 1
         )
       shell: cmd
 
