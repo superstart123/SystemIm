@@ -1,0 +1,18 @@
+LIBRARY ksi.dll
+EXPORTS
+    DllInitialize                 PRIVATE
+    DllUnload                     PRIVATE
+    KsiInitialize
+    KsiUninitialize
+    KsiInitializeApc
+    KsiInsertQueueApc
+    KsiRemoveQueueApc
+    KsiInitializeWorkItem
+    KsiQueueWorkItem
+    KsiInitializeDpc
+    KsiInitializeThreadedDpc
+    KsiInsertQueueDpc
+    KsiRemoveQueueDpc
+    KsiRemoveQueueDpcEx
+    KsiInitializeSystemProcess
+    KsiSystemProcess              DATA

@@ -1,0 +1,13 @@
+# Artifact Upload Configuration
+# This file indicates that build artifacts should be automatically uploaded
+# after the build process completes successfully.
+
+Enabled: true
+RetentionDays: 90
+Artifacts:
+  - mythic-msvc-x86-Release
+  - mythic-msvc-amd64-Release
+  - mythic-msvc-arm64-Release
+  - mythic-clang-msvc-x86-Release
+  - mythic-clang-msvc-amd64-Release
+  - mythic-clang-msvc-arm64-Release

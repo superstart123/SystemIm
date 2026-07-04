@@ -1,0 +1,611 @@
+/*
+ * Copyright (c) 2022 Winsider Seminars & Solutions, Inc.  All rights reserved.
+ *
+ * This file is part of System Informer.
+ *
+ * Authors:
+ *
+ *     jxy-s   2022-2026
+ *
+ */
+
+#pragma once
+
+#ifdef _KERNEL_MODE
+#define PHNT_MODE PHNT_MODE_KERNEL
+#endif
+#pragma warning(push)
+#pragma warning(disable : 4201)
+
+// Process
+
+typedef _Enum_is_bitflag_ enum _KPH_PROCESS_STATE
+{
+    KPH_PROCESS_STATE_NONE                         = 0x00000000,
+
+    KPH_PROCESS_SECURELY_CREATED                   = 0x00000001,
+    KPH_PROCESS_VERIFIED_PROCESS                   = 0x00000002,
+    KPH_PROCESS_PROTECTED_PROCESS                  = 0x00000004,
+    KPH_PROCESS_NO_UNTRUSTED_IMAGES                = 0x00000008,
+    KPH_PROCESS_HAS_FILE_OBJECT                    = 0x00000010,
+    KPH_PROCESS_HAS_SECTION_OBJECT_POINTERS        = 0x00000020,
+    KPH_PROCESS_NO_USER_WRITABLE_REFERENCES        = 0x00000040,
+    KPH_PROCESS_NO_FILE_TRANSACTION                = 0x00000080,
+    KPH_PROCESS_NOT_BEING_DEBUGGED                 = 0x00000100,
+    KPH_PROCESS_NO_WRITABLE_FILE_OBJECT            = 0x00000200,
+    KPH_PROCESS_CREATE_NOTIFICATION                = 0x00000400,
+
+    KPH_PROCESS_STATE_MAXIMUM = (KPH_PROCESS_SECURELY_CREATED                 |\
+                                 KPH_PROCESS_VERIFIED_PROCESS                 |\
+                                 KPH_PROCESS_PROTECTED_PROCESS                |\
+                                 KPH_PROCESS_NO_UNTRUSTED_IMAGES              |\
+                                 KPH_PROCESS_HAS_FILE_OBJECT                  |\
+                                 KPH_PROCESS_HAS_SECTION_OBJECT_POINTERS      |\
+                                 KPH_PROCESS_NO_USER_WRITABLE_REFERENCES      |\
+                                 KPH_PROCESS_NO_FILE_TRANSACTION              |\
+                                 KPH_PROCESS_NOT_BEING_DEBUGGED               |\
+                                 KPH_PROCESS_NO_WRITABLE_FILE_OBJECT          |\
+                                 KPH_PROCESS_CREATE_NOTIFICATION),
+
+    KPH_PROCESS_STATE_HIGH    = (KPH_PROCESS_VERIFIED_PROCESS                 |\
+                                 KPH_PROCESS_PROTECTED_PROCESS                |\
+                                 KPH_PROCESS_NO_UNTRUSTED_IMAGES              |\
+                                 KPH_PROCESS_HAS_FILE_OBJECT                  |\
+                                 KPH_PROCESS_HAS_SECTION_OBJECT_POINTERS      |\
+                                 KPH_PROCESS_NO_USER_WRITABLE_REFERENCES      |\
+                                 KPH_PROCESS_NO_FILE_TRANSACTION              |\
+                                 KPH_PROCESS_NOT_BEING_DEBUGGED               |\
+                                 KPH_PROCESS_NO_WRITABLE_FILE_OBJECT          |\
+                                 KPH_PROCESS_CREATE_NOTIFICATION),
+
+    KPH_PROCESS_STATE_MEDIUM  = (KPH_PROCESS_VERIFIED_PROCESS                 |\
+                                 KPH_PROCESS_PROTECTED_PROCESS                |\
+                                 KPH_PROCESS_HAS_FILE_OBJECT                  |\
+                                 KPH_PROCESS_HAS_SECTION_OBJECT_POINTERS      |\
+                                 KPH_PROCESS_NO_USER_WRITABLE_REFERENCES      |\
+                                 KPH_PROCESS_NO_FILE_TRANSACTION              |\
+                                 KPH_PROCESS_NO_WRITABLE_FILE_OBJECT),
+
+    KPH_PROCESS_STATE_LOW     = (KPH_PROCESS_VERIFIED_PROCESS                 |\
+                                 KPH_PROCESS_HAS_FILE_OBJECT                  |\
+                                 KPH_PROCESS_HAS_SECTION_OBJECT_POINTERS      |\
+                                 KPH_PROCESS_NO_USER_WRITABLE_REFERENCES      |\
+                                 KPH_PROCESS_NO_FILE_TRANSACTION              |\
+                                 KPH_PROCESS_NO_WRITABLE_FILE_OBJECT),
+
+    KPH_PROCESS_STATE_MINIMUM = (KPH_PROCESS_HAS_FILE_OBJECT                  |\
+                                 KPH_PROCESS_HAS_SECTION_OBJECT_POINTERS      |\
+                                 KPH_PROCESS_NO_USER_WRITABLE_REFERENCES      |\
+                                 KPH_PROCESS_NO_FILE_TRANSACTION              |\
+                                 KPH_PROCESS_NO_WRITABLE_FILE_OBJECT),
+} KPH_PROCESS_STATE, *PKPH_PROCESS_STATE;
+DEFINE_ENUM_FLAG_OPERATORS(KPH_PROCESS_STATE);
+C_ASSERT(sizeof(KPH_PROCESS_STATE) == sizeof(ULONG));
+
+typedef enum _KPH_PROCESS_INFORMATION_CLASS
+{
+    KphProcessBasicInformation,      // q: KPH_PROCESS_BASIC_INFORMATION
+    KphProcessStateInformation,      // q: KPH_PROCESS_STATE
+    KphProcessQuotaLimits,           // s: QUOTA_LIMITS
+    KphProcessBasePriority,          // s: KPRIORITY
+    KphProcessRaisePriority,         // s: ULONG
+    KphProcessPriorityClass,         // s: PROCESS_PRIORITY_CLASS
+    KphProcessAffinityMask,          // s: KAFFINITY/GROUP_AFFINITY
+    KphProcessPriorityBoost,         // s: ULONG
+    KphProcessIoPriority,            // s: IO_PRIORITY_HINT
+    KphProcessPagePriority,          // s: PAGE_PRIORITY_INFORMATION
+    KphProcessPowerThrottlingState,  // s: POWER_THROTTLING_PROCESS_STATE
+    KphProcessPriorityClassEx,       // s: PROCESS_PRIORITY_CLASS_EX
+    KphProcessEmptyWorkingSet,       // s
+    KphProcessWSLProcessId,          // q: ULONG
+    KphProcessSequenceNumber,        // q: ULONG64
+    KphProcessStartKey,              // q: ULONG64
+    KphProcessImageSection,          // q: HANDLE
+    KphProcessImageFileName,         // q: UNICODE_STRING
+} KPH_PROCESS_INFORMATION_CLASS;
+
+typedef enum _KPH_THREAD_INFORMATION_CLASS
+{
+    KphThreadPriority,               // s: KPRIORITY
+    KphThreadBasePriority,           // s: KPRIORITY
+    KphThreadAffinityMask,           // s: KAFFINITY
+    KphThreadIdealProcessor,         // s: ULONG
+    KphThreadPriorityBoost,          // s: ULONG
+    KphThreadIoPriority,             // s: IO_PRIORITY_HINT
+    KphThreadPagePriority,           // s: PAGE_PRIORITY_INFORMATION
+    KphThreadActualBasePriority,     // s: LONG
+    KphThreadGroupInformation,       // s: GROUP_AFFINITY
+    KphThreadIdealProcessorEx,       // s: PROCESSOR_NUMBER
+    KphThreadActualGroupAffinity,    // s: GROUP_AFFINITY
+    KphThreadPowerThrottlingState,   // s: POWER_THROTTLING_THREAD_STATE
+    KphThreadIoCounters,             // q: IO_COUNTERS
+    KphThreadWSLThreadId,            // q: ULONG
+    KphThreadExplicitCaseSensitivity,// s: ULONG; s: 0 disables, otherwise enables
+    KphThreadKernelStackInformation, // q: KPH_KERNEL_STACK_INFORMATION
+} KPH_THREAD_INFORMATION_CLASS;
+
+typedef struct _KPH_PROCESS_BASIC_INFORMATION
+{
+    KPH_PROCESS_STATE ProcessState;
+
+    ULONG64 ProcessStartKey;
+    CLIENT_ID CreatorClientId;
+
+    ULONG UserWritableReferences;
+
+    SIZE_T NumberOfImageLoads;
+
+    union
+    {
+        ULONG Flags;
+        struct
+        {
+            ULONG CreateNotification : 1;
+            ULONG ExitNotification : 1;
+            ULONG VerifiedProcess : 1;
+            ULONG SecurelyCreated : 1;
+            ULONG Protected : 1;
+            ULONG IsWow64 : 1;
+            ULONG IsSubsystemProcess : 1;
+            ULONG AllocatedImageName : 1;
+            ULONG Reserved : 24;
+        };
+    };
+
+    SIZE_T NumberOfThreads;
+
+    //
+    // Only valid if Protected flag is set.
+    //
+    ACCESS_MASK ProcessAllowedMask;
+    ACCESS_MASK ThreadAllowedMask;
+
+    //
+    // These are only tracked for verified processes.
+    //
+    SIZE_T NumberOfMicrosoftImageLoads;
+    SIZE_T NumberOfAntimalwareImageLoads;
+    SIZE_T NumberOfVerifiedImageLoads;
+    SIZE_T NumberOfUntrustedImageLoads;
+} KPH_PROCESS_BASIC_INFORMATION, *PKPH_PROCESS_BASIC_INFORMATION;
+
+typedef struct _KPH_KERNEL_STACK_INFORMATION
+{
+    PVOID InitialStack;
+    PVOID StackLimit;
+    PVOID StackBase;
+    PVOID KernelStack;
+} KPH_KERNEL_STACK_INFORMATION, *PKPH_KERNEL_STACK_INFORMATION;
+
+// Process handle information
+
+typedef struct _KPH_PROCESS_HANDLE
+{
+    HANDLE Handle;
+    PVOID Object;
+    ACCESS_MASK GrantedAccess;
+    USHORT ObjectTypeIndex;
+    USHORT Reserved1;
+    ULONG HandleAttributes;
+    ULONG Reserved2;
+} KPH_PROCESS_HANDLE, *PKPH_PROCESS_HANDLE;
+
+typedef struct _KPH_PROCESS_HANDLE_INFORMATION
+{
+    ULONG HandleCount;
+    _Field_size_(HandleCount) KPH_PROCESS_HANDLE Handles[1];
+} KPH_PROCESS_HANDLE_INFORMATION, *PKPH_PROCESS_HANDLE_INFORMATION;
+
+// Object information
+
+typedef enum _KPH_OBJECT_INFORMATION_CLASS
+{
+    KphObjectBasicInformation,                // q: OBJECT_BASIC_INFORMATION
+    KphObjectNameInformation,                 // q: OBJECT_NAME_INFORMATION
+    KphObjectTypeInformation,                 // q: OBJECT_TYPE_INFORMATION
+    KphObjectHandleFlagInformation,           // qs: OBJECT_HANDLE_FLAG_INFORMATION
+    KphObjectProcessBasicInformation,         // q: PROCESS_BASIC_INFORMATION
+    KphObjectThreadBasicInformation,          // q: THREAD_BASIC_INFORMATION
+    KphObjectEtwRegBasicInformation,          // q: ETWREG_BASIC_INFORMATION
+    KphObjectFileObjectInformation,           // q: KPH_FILE_OBJECT_INFORMATION
+    KphObjectFileObjectDriver,                // q: HANDLE
+    KphObjectProcessTimes,                    // q: KERNEL_USER_TIMES
+    KphObjectThreadTimes,                     // q: KERNEL_USER_TIMES
+    KphObjectProcessImageFileName,            // q: UNICODE_STRING
+    KphObjectThreadNameInformation,           // q: THREAD_NAME_INFORMATION
+    KphObjectThreadIsTerminated,              // q: ULONG
+    KphObjectSectionBasicInformation,         // q: SECTION_BASIC_INFORMATION
+    KphObjectSectionFileName,                 // q: UNICODE_STRING
+    KphObjectSectionImageInformation,         // q; SECTION_IMAGE_INFORMATION
+    KphObjectSectionRelocationInformation,    // q; PVOID RelocationAddress
+    KphObjectSectionOriginalBaseInformation,  // q: PVOID BaseAddress
+    KphObjectSectionInternalImageInformation, // q: SECTION_INTERNAL_IMAGE_INFORMATION
+    KphObjectSectionMappingsInformation,      // q: KPH_SECTION_MAPPINGS_INFORMATION
+    KphObjectAttributesInformation,           // q: KPH_OBJECT_ATTRIBUTES_INFORMATION
+    MaxKphObjectInfoClass
+} KPH_OBJECT_INFORMATION_CLASS;
+
+typedef struct _KPH_VPB
+{
+    CSHORT Type;
+    CSHORT Size;
+    USHORT Flags;
+    USHORT VolumeLabelLength;
+    ULONG SerialNumber;
+    ULONG ReferenceCount;
+    WCHAR VolumeLabel[32];
+} KPH_VPB, *PKPH_VPB;
+
+typedef struct _KPH_DEVICE_INFO
+{
+    DEVICE_TYPE Type;
+    ULONG Characteristics;
+    ULONG Flags;
+    KPH_VPB Vpb;
+} KPH_DEVICE_INFO, *PKPH_DEVICE_INFO;
+
+typedef struct _KPH_FILE_OBJECT_INFORMATION
+{
+    BOOLEAN LockOperation;
+    BOOLEAN DeletePending;
+    BOOLEAN ReadAccess;
+    BOOLEAN WriteAccess;
+    BOOLEAN DeleteAccess;
+    BOOLEAN SharedRead;
+    BOOLEAN SharedWrite;
+    BOOLEAN SharedDelete;
+    LARGE_INTEGER CurrentByteOffset;
+    ULONG Flags;
+    ULONG UserWritableReferences;
+    BOOLEAN HasActiveTransaction;
+    BOOLEAN IsIgnoringSharing;
+    LONG Waiters;
+    LONG Busy;
+    KPH_VPB Vpb;
+    KPH_DEVICE_INFO Device;
+    KPH_DEVICE_INFO AttachedDevice;
+    KPH_DEVICE_INFO RelatedDevice;
+} KPH_FILE_OBJECT_INFORMATION, *PKPH_FILE_OBJECT_INFORMATION;
+
+typedef struct _KPH_OBJECT_ATTRIBUTES_INFORMATION
+{
+    union
+    {
+        UCHAR Flags;
+        struct
+        {
+            UCHAR NewObject : 1;
+            UCHAR KernelObject : 1;
+            UCHAR KernelOnlyAccess : 1;
+            UCHAR ExclusiveObject : 1;
+            UCHAR PermanentObject : 1;
+            UCHAR DefaultSecurityQuota : 1;
+            UCHAR SingleHandleEntry : 1;
+            UCHAR DeletedInline : 1;
+        };
+    };
+} KPH_OBJECT_ATTRIBUTES_INFORMATION, *PKPH_OBJECT_ATTRIBUTES_INFORMATION;
+
+// Driver information
+
+typedef enum _KPH_DRIVER_INFORMATION_CLASS
+{
+    KphDriverBasicInformation,          // q: DRIVER_BASIC_INFORMATION
+    KphDriverNameInformation,           // q: UNICODE_STRING
+    KphDriverServiceKeyNameInformation, // q: UNICODE_STRING
+    KphDriverImageFileNameInformation,  // q: UNICODE_STRING
+    MaxKphDriverInfoClass
+} KPH_DRIVER_INFORMATION_CLASS;
+
+typedef struct _KPH_DRIVER_BASIC_INFORMATION
+{
+    ULONG Flags;
+    PVOID DriverStart;
+    ULONG DriverSize;
+} KPH_DRIVER_BASIC_INFORMATION, *PKPH_DRIVER_BASIC_INFORMATION;
+
+typedef struct _KPH_DRIVER_NAME_INFORMATION
+{
+    UNICODE_STRING DriverName;
+} KPH_DRIVER_NAME_INFORMATION, *PKPH_DRIVER_NAME_INFORMATION;
+
+typedef struct _KPH_DRIVER_SERVICE_KEY_NAME_INFORMATION
+{
+    UNICODE_STRING ServiceKeyName;
+} KPH_DRIVER_SERVICE_KEY_NAME_INFORMATION, *PKPH_DRIVER_SERVICE_KEY_NAME_INFORMATION;
+
+// ETW registration object information
+
+typedef struct _KPH_ETWREG_BASIC_INFORMATION
+{
+    GUID Guid;
+    ULONG_PTR SessionId;
+} KPH_ETWREG_BASIC_INFORMATION, *PKPH_ETWREG_BASIC_INFORMATION;
+
+// ALPC object information
+
+typedef enum _KPH_ALPC_INFORMATION_CLASS
+{
+    KphAlpcBasicInformation,               // q: KPH_ALPC_BASIC_INFORMATION
+    KphAlpcCommunicationInformation,       // q: KPH_ALPC_COMMUNICATION_INFORMATION
+    KphAlpcCommunicationNamesInformation,  // q: KPH_ALPC_COMMUNICATION_NAMES_INFORMATION
+} KPH_ALPC_INFORMATION_CLASS;
+
+typedef struct _KPH_ALPC_BASIC_INFORMATION
+{
+    HANDLE OwnerProcessId;
+    ULONG Flags;
+    LONG SequenceNo;
+    PVOID PortContext;
+    union
+    {
+        ULONG State;
+        struct
+        {
+            ULONG Initialized : 1;
+            ULONG Type : 2;
+            ULONG ConnectionPending : 1;
+            ULONG ConnectionRefused : 1;
+            ULONG Disconnected : 1;
+            ULONG Closed : 1;
+            ULONG NoFlushOnClose : 1;
+            ULONG ReturnExtendedInfo : 1;
+            ULONG Waitable : 1;
+            ULONG DynamicSecurity : 1;
+            ULONG Wow64CompletionList : 1;
+            ULONG Lpc : 1;
+            ULONG LpcToLpc : 1;
+            ULONG HasCompletionList : 1;
+            ULONG HadCompletionList : 1;
+            ULONG EnableCompletionList : 1;
+        };
+    };
+} KPH_ALPC_BASIC_INFORMATION, *PKPH_ALPC_BASIC_INFORMATION;
+
+typedef struct _KPH_ALPC_COMMUNICATION_INFORMATION
+{
+    KPH_ALPC_BASIC_INFORMATION ConnectionPort;
+    KPH_ALPC_BASIC_INFORMATION ServerCommunicationPort;
+    KPH_ALPC_BASIC_INFORMATION ClientCommunicationPort;
+} KPH_ALPC_COMMUNICATION_INFORMATION, *PKPH_ALPC_COMMUNICATION_INFORMATION;
+
+typedef struct _KPH_ALPC_COMMUNICATION_NAMES_INFORMATION
+{
+    UNICODE_STRING ConnectionPort;
+    UNICODE_STRING ServerCommunicationPort;
+    UNICODE_STRING ClientCommunicationPort;
+} KPH_ALPC_COMMUNICATION_NAMES_INFORMATION, *PKPH_ALPC_COMMUNICATION_NAMES_INFORMATION;
+
+// System control
+
+typedef enum _KPH_SYSTEM_CONTROL_CLASS
+{
+    KphSystemControlEmptyCompressionStore
+} KPH_SYSTEM_CONTROL_CLASS;
+
+// Section
+
+typedef enum _KPH_SECTION_INFORMATION_CLASS
+{
+    KphSectionMappingsInformation, // q: KPH_SECTION_MAPPINGS_INFORMATION
+} KPH_SECTION_INFORMATION_CLASS;
+
+#define VIEW_MAP_TYPE_PROCESS         1
+#define VIEW_MAP_TYPE_SESSION         2
+#define VIEW_MAP_TYPE_SYSTEM_CACHE    3
+
+typedef struct _KPH_SECTION_MAP_ENTRY
+{
+    UCHAR ViewMapType;
+    HANDLE ProcessId;
+    PVOID StartVa;
+    PVOID EndVa;
+} KPH_SECTION_MAP_ENTRY, *PKPH_SECTION_MAP_ENTRY;
+
+typedef struct _KPH_SECTION_MAPPINGS_INFORMATION
+{
+    ULONG NumberOfMappings;
+    KPH_SECTION_MAP_ENTRY Mappings[ANYSIZE_ARRAY];
+} KPH_SECTION_MAPPINGS_INFORMATION, *PKPH_SECTION_MAPPINGS_INFORMATION;
+
+// Virtual memory
+
+typedef enum _KPH_MEMORY_INFORMATION_CLASS
+{
+    KphMemoryImageSection,          // q: HANDLE
+    KphMemoryDataSection,           // q: KPH_MEMORY_DATA_SECTION
+    KphMemoryMappedInformation,     // q: KPH_MEMORY_MAPPED_INFORMATION
+} KPH_MEMORY_INFORMATION_CLASS, *PKPH_MEMORY_INFORMATION_CLASS;
+
+typedef struct _KPH_MEMORY_DATA_SECTION
+{
+    HANDLE SectionHandle;
+    LARGE_INTEGER SectionFileSize;
+} KPH_MEMORY_DATA_SECTION, *PKPH_MEMORY_DATA_SECTION;
+
+typedef struct _KPH_MEMORY_MAPPED_INFORMATION
+{
+    PVOID FileObject;
+    PVOID SectionObjectPointers;
+    PVOID DataControlArea;
+    PVOID SharedCacheMap;
+    PVOID ImageControlArea;
+    ULONG UserWritableReferences;
+} KPH_MEMORY_MAPPED_INFORMATION, *PKPH_MEMORY_MAPPED_INFORMATION;
+
+// File
+
+typedef enum _KPH_HASH_ALGORITHM
+{
+    KphHashAlgorithmMd5,
+    KphHashAlgorithmSha1,
+    KphHashAlgorithmSha1Authenticode,
+    KphHashAlgorithmSha256,
+    KphHashAlgorithmSha256Authenticode,
+    KphHashAlgorithmSha384,
+    KphHashAlgorithmSha512,
+    MaxKphHashAlgorithm,
+} KPH_HASH_ALGORITHM, *PKPH_HASH_ALGORITHM;
+
+#define KPH_HASH_ALGORITHM_MAX_LENGTH (512 / 8)
+
+typedef struct _KPH_HASH_INFORMATION
+{
+    KPH_HASH_ALGORITHM Algorithm;
+    ULONG Length;
+    BYTE Hash[KPH_HASH_ALGORITHM_MAX_LENGTH];
+} KPH_HASH_INFORMATION, *PKPH_HASH_INFORMATION;
+
+// Verification
+
+#define KPH_PROCESS_READ_ACCESS   (STANDARD_RIGHTS_READ                       |\
+                                   SYNCHRONIZE                                |\
+                                   PROCESS_QUERY_INFORMATION                  |\
+                                   PROCESS_QUERY_LIMITED_INFORMATION          |\
+                                   PROCESS_VM_READ)
+
+#define KPH_THREAD_READ_ACCESS    (STANDARD_RIGHTS_READ                       |\
+                                   SYNCHRONIZE                                |\
+                                   THREAD_QUERY_INFORMATION                   |\
+                                   THREAD_QUERY_LIMITED_INFORMATION           |\
+                                   THREAD_GET_CONTEXT)
+
+#define KPH_TOKEN_READ_ACCESS     (STANDARD_RIGHTS_READ                       |\
+                                   SYNCHRONIZE                                |\
+                                   TOKEN_QUERY                                |\
+                                   TOKEN_QUERY_SOURCE)
+
+#define KPH_JOB_READ_ACCESS       (STANDARD_RIGHTS_READ                       |\
+                                   SYNCHRONIZE                                |\
+                                   JOB_OBJECT_QUERY)
+
+#define KPH_FILE_READ_ACCESS      (STANDARD_RIGHTS_READ                       |\
+                                   SYNCHRONIZE                                |\
+                                   FILE_READ_DATA                             |\
+                                   FILE_READ_ATTRIBUTES                       |\
+                                   FILE_READ_EA)
+
+#define KPH_FILE_READ_DISPOSITION (FILE_OPEN)
+
+#define KPH_SECTION_READ_ACCESS   (SECTION_MAP_READ | SECTION_QUERY)
+
+// Informer
+
+typedef struct _KPH_RATE_LIMIT_POLICY
+{
+    ULONG TokensPerPeriod;
+    ULONG PeriodInSeconds;
+    ULONG MaxBucketSize;
+} KPH_RATE_LIMIT_POLICY, *PKPH_RATE_LIMIT_POLICY;
+typedef const KPH_RATE_LIMIT_POLICY* PCKPH_RATE_LIMIT_POLICY;
+
+#define KPH_RATE_LIMIT_UNLIMITED             { ULONG_MAX, 0, ULONG_MAX }
+#define KPH_RATE_LIMIT_DENY_ALL              { 0, 0, 0 }
+#define KPH_RATE_LIMIT_PER_SEC(rate, burst)  { rate, 1, burst }
+#define KPH_RATE_LIMIT_PER_MIN(rate, burst)  { rate, 60, burst }
+#define KPH_RATE_LIMIT_PER_HOUR(rate, burst) { rate, 3600, burst }
+#define KPH_RATE_LIMIT_PER_DAY(rate, burst)  { rate, 86400, burst }
+
+#define KPH_INFORMER_COUNT       155
+#define KPH_INFORMER_INDEX(name) (KphMsg##name - (MaxKphMsgClientAllowed + 1))
+
+typedef union _KPH_INFORMER_OPTIONS
+{
+    struct
+    {
+        ULONG EnableStackTraces : 1;
+        ULONG EnableProcessCreateReply : 1;
+        ULONG FileEnablePreCreateReply : 1;
+        ULONG FileEnablePostCreateReply : 1;
+        ULONG FileEnablePostFileNames : 1;
+        ULONG FileEnablePagingIo : 1;
+        ULONG FileEnableSyncPagingIo : 1;
+        ULONG FileEnableIoControlBuffers : 1;
+        ULONG FileEnableFsControlBuffers : 1;
+        ULONG FileEnableDirControlBuffers : 1;
+        ULONG RegEnablePostObjectNames : 1;
+        ULONG RegEnablePostValueNames : 1;
+        ULONG RegEnableValueBuffers : 1;
+        ULONG Spare : 19;
+    };
+
+    ULONG Flags;
+} KPH_INFORMER_OPTIONS, *PKPH_INFORMER_OPTIONS;
+
+typedef struct _KPH_INFORMER_SETTINGS
+{
+    KPH_INFORMER_OPTIONS Options;
+    KPH_RATE_LIMIT_POLICY Policy[KPH_INFORMER_COUNT];
+} KPH_INFORMER_SETTINGS, *PKPH_INFORMER_SETTINGS;
+typedef const KPH_INFORMER_SETTINGS* PCKPH_INFORMER_SETTINGS;
+
+typedef struct _KPH_MESSAGE_TIMEOUTS
+{
+    LARGE_INTEGER AsyncTimeout;
+    LARGE_INTEGER DefaultTimeout;
+    LARGE_INTEGER ProcessCreateTimeout;
+    LARGE_INTEGER FilePreCreateTimeout;
+    LARGE_INTEGER FilePostCreateTimeout;
+} KPH_MESSAGE_TIMEOUTS, *PKPH_MESSAGE_TIMEOUTS;
+
+typedef struct _KPH_INFORMER_CLIENT_SETTINGS
+{
+    KPH_MESSAGE_TIMEOUTS MessageTimeouts;
+    KPH_RATE_LIMIT_POLICY AsyncQueuePolicy;
+    KPH_RATE_LIMIT_POLICY InformerPolicy[KPH_INFORMER_COUNT];
+} KPH_INFORMER_CLIENT_SETTINGS, *PKPH_INFORMER_CLIENT_SETTINGS;
+
+typedef struct _KPH_RATE_LIMIT_STATS
+{
+    KPH_RATE_LIMIT_POLICY Policy;
+    LONG64 Allowed;
+    LONG64 Dropped;
+    LONG64 CasMiss;
+} KPH_RATE_LIMIT_STATS, *PKPH_RATE_LIMIT_STATS;
+
+typedef struct _KPH_INFORMER_CLIENT_STATS
+{
+    KPH_RATE_LIMIT_STATS AsyncQueueRateLimit;
+    KPH_RATE_LIMIT_STATS InformerRateLimit[KPH_INFORMER_COUNT];
+} KPH_INFORMER_CLIENT_STATS, *PKPH_INFORMER_CLIENT_STATS;
+
+typedef struct _KPH_INFORMER_STATS
+{
+    KPH_RATE_LIMIT_STATS RateLimit[KPH_INFORMER_COUNT];
+} KPH_INFORMER_STATS, *PKPH_INFORMER_STATS;
+
+// Parameters
+
+typedef union _KPH_PARAMETER_FLAGS
+{
+    struct
+    {
+        ULONG DisableImageLoadProtection : 1;
+        ULONG RandomizedPoolTag : 1;
+        ULONG DynDataNoEmbedded : 1;
+        ULONG DisableSystemProcess : 1;
+        ULONG DisableThreadNames : 1;
+        ULONG Reserved : 27;
+    };
+
+    ULONG Flags;
+} KPH_PARAMETER_FLAGS, *PKPH_PARAMETER_FLAGS;
+
+// Session Token
+
+#define KPH_TOKEN_PRIVILEGE_TERMINATE 0x00000001ul
+#define KPH_TOKEN_VALID_PRIVILEGES    (KPH_TOKEN_PRIVILEGE_TERMINATE)
+
+#include <pshpack1.h>
+typedef struct _KPH_SESSION_ACCESS_TOKEN
+{
+    LARGE_INTEGER Expiry;
+    ULONG Privileges;
+    LONG Uses;
+    GUID Identifier;
+    BYTE Material[32];
+} KPH_SESSION_ACCESS_TOKEN, *PKPH_SESSION_ACCESS_TOKEN;
+C_ASSERT(sizeof(KPH_SESSION_ACCESS_TOKEN) == 64);
+#include <poppack.h>
+
+#pragma warning(pop)

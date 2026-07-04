@@ -1,0 +1,47 @@
+#
+# Copyright (c) 2022 Winsider Seminars & Solutions, Inc.  All rights reserved.
+#
+# This file is part of System Informer.
+#
+
+set(HEADERS
+    "onlnchk.h"
+    "resource.h"
+)
+source_group("Header Files" FILES ${HEADERS})
+
+set(RESOURCES
+    "version.rc"
+    "OnlineChecks.rc"
+)
+source_group("Resource Files" FILES ${RESOURCES})
+
+set(SOURCES
+    "api.c"
+    "exclude.c"
+    "scan.c"
+    "main.c"
+    "options.c"
+    "partner.c"
+    "page1.c"
+    "page2.c"
+    "page3.c"
+    "page4.c"
+    "partner.c"
+    "scan.c"
+    "upload.c"
+)
+source_group("Source Files" FILES ${SOURCES})
+
+set(ALL_FILES
+    ${HEADERS}
+    ${RESOURCES}
+    ${SOURCES}
+)
+
+si_add_plugin(OnlineChecks ${ALL_FILES})
+
+target_link_libraries(OnlineChecks PRIVATE
+    user32
+    gdi32
+)

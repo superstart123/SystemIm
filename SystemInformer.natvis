@@ -1,0 +1,146 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+Copyright (c) 2022 Winsider Seminars & Solutions, Inc.  All rights reserved.
+
+This file is part of System Informer.
+
+Authors:
+
+    jxy-s   2024
+-->
+
+<!-- Debugger Visualizers -->
+<AutoVisualizer xmlns="http://schemas.microsoft.com/vstudio/debugger/natvis/2010">
+
+    <!-- PH_STRING -->
+    <Type Name="_PH_STRING">
+        <DisplayString>{Buffer,[Length / 2]su}</DisplayString>
+        <Expand>
+            <Item Name="[string]" ExcludeView="simple">Buffer,[Length / 2]su</Item>
+            <Item Name="[bytes]">Length</Item>
+            <Item Name="[length]">Length / 2</Item>
+            <Item Name="[real-length]">wcslen(Buffer)</Item>
+        </Expand>
+    </Type>
+
+    <!-- PH_STRINGREF -->
+    <Type Name="_PH_STRINGREF">
+        <DisplayString>{Buffer,[Length / 2]su}</DisplayString>
+        <Expand>
+            <Item Name="[string]" ExcludeView="simple">Buffer,[Length / 2]su</Item>
+            <Item Name="[bytes]">Length</Item>
+            <Item Name="[length]">Length / 2</Item>
+            <Item Name="[real-length]">wcslen(Buffer)</Item>
+        </Expand>
+    </Type>
+
+    <!-- PH_LIST -->
+    <Type Name="_PH_LIST">
+        <DisplayString>Count = {Count}</DisplayString>
+        <Expand>
+            <Item Name="[size]" ExcludeView="simple">Count</Item>
+            <Item Name="[capacity]" ExcludeView="simple">AllocatedCount</Item>
+            <ArrayItems>
+                <Size>Count</Size>
+                <ValuePointer>Items</ValuePointer>
+            </ArrayItems>
+
+            <CustomListItems>
+                <Variable Name="i" InitialValue="0"/>
+                <Loop Condition="i &lt; Count">
+                    <Item Name="[{i}] PPH_PROCESS_ITEM">*((PPH_PROCESS_ITEM)Items[i])</Item>
+                    <Exec>i = i + 1</Exec>
+                </Loop>
+            </CustomListItems>
+
+            <CustomListItems>
+                <Variable Name="i" InitialValue="0"/>
+                <Loop Condition="i &lt; Count">
+                    <Item Name="[{i}] PPH_THREAD_ITEM">*((PPH_THREAD_ITEM)Items[i])</Item>
+                    <Exec>i = i + 1</Exec>
+                </Loop>
+            </CustomListItems>
+
+            <CustomListItems>
+                <Variable Name="i" InitialValue="0"/>
+                <Loop Condition="i &lt; Count">
+                    <Item Name="[{i}] PPH_MODULE_ITEM">*((PPH_MODULE_ITEM)Items[i])</Item>
+                    <Exec>i = i + 1</Exec>
+                </Loop>
+            </CustomListItems>
+
+            <CustomListItems>
+                <Variable Name="i" InitialValue="0"/>
+                <Loop Condition="i &lt; Count">
+                    <Item Name="[{i}] PPH_SERVICE_ITEM">*((PPH_SERVICE_ITEM)Items[i])</Item>
+                    <Exec>i = i + 1</Exec>
+                </Loop>
+            </CustomListItems>
+
+            <!-- <CustomListItems>
+                <Variable Name="i" InitialValue="0"/>
+                <Loop Condition="i &lt; Count">
+                    <Item Name="PFW_EVENT_ITEM [{i}]">*((PFW_EVENT_ITEM)Items[i])</Item>
+                    <Exec>i = i + 1</Exec>
+                </Loop>
+            </CustomListItems> -->
+
+            <CustomListItems>
+                <Variable Name="i" InitialValue="0"/>
+                <Loop Condition="i &lt; Count">
+                    <Item Name="[{i}] PPH_PROCESS_RECORD">*((PPH_PROCESS_RECORD)Items[i])</Item>
+                    <Exec>i = i + 1</Exec>
+                </Loop>
+            </CustomListItems>
+
+            <CustomListItems>
+                <Variable Name="i" InitialValue="0"/>
+                <Loop Condition="i &lt; Count">
+                    <Item Name="[{i}] PPH_STRING">*((PPH_STRING)Items[i])</Item>
+                    <Exec>i = i + 1</Exec>
+                </Loop>
+            </CustomListItems>
+
+            <CustomListItems>
+                <Variable Name="i" InitialValue="0"/>
+                <Loop Condition="i &lt; Count">
+                    <Item Name="[{i}] PKPH_MESSAGE">*((PKPH_MESSAGE)Items[i])</Item>
+                    <Exec>i = i + 1</Exec>
+                </Loop>
+            </CustomListItems>
+
+            <CustomListItems>
+                <Variable Name="i" InitialValue="0"/>
+                <Loop Condition="i &lt; Count">
+                    <Item Name="[{i}] PPH_SYSINFO_SECTION">*((PPH_SYSINFO_SECTION)Items[i])</Item>
+                    <Exec>i = i + 1</Exec>
+                </Loop>
+            </CustomListItems>
+
+            <!-- <CustomListItems>
+                <Variable Name="i" InitialValue="0"/>
+                <Loop Condition="i &lt; Count">
+                    <Item Name="PETP_GPU_ADAPTER [{i}]">*((PETP_GPU_ADAPTER)Items[i])</Item>
+                    <Exec>i = i + 1</Exec>
+                </Loop>
+            </CustomListItems> -->
+
+            <!-- <CustomListItems>
+                <Variable Name="i" InitialValue="0"/>
+                <Loop Condition="i &lt; Count">
+                    <Item Name="PETP_NPU_ADAPTER [{i}]">*((PETP_NPU_ADAPTER)Items[i])</Item>
+                    <Exec>i = i + 1</Exec>
+                </Loop>
+            </CustomListItems> -->
+
+            <!-- <CustomListItems>
+                <Variable Name="i" InitialValue="0"/>
+                <Loop Condition="i &lt; Count">
+                    <Item Name="CONTEXT_PERF_ITEM [{i}]">*((CONTEXT_PERF_ITEM *)Items[i])</Item>
+                    <Exec>i = i + 1</Exec>
+                </Loop>
+            </CustomListItems> -->
+        </Expand>
+    </Type>
+
+</AutoVisualizer>

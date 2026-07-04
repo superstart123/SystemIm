@@ -1,0 +1,1049 @@
+/*
+ * Copyright (c) 2022 Winsider Seminars & Solutions, Inc.  All rights reserved.
+ *
+ * This file is part of System Informer.
+ *
+ * Authors:
+ *
+ *     wj32    2010
+ *     dmex    2017-2026
+ *
+ */
+
+#include <phapp.h>
+#include <emenu.h>
+#include <mainwnd.h>
+#include <memsrch.h>
+#include <memprv.h>
+#include <procprv.h>
+#include <phsettings.h>
+#include <settings.h>
+#include <strsrch.h>
+#include <colmgr.h>
+#include <cpysave.h>
+
+#define WM_PH_MEMORY_STATUS_UPDATE (WM_APP + 301)
+
+#define PH_SEARCH_COMPLETED 2
+
+typedef struct _MEMORY_STRING_CONTEXT
+{
+    HANDLE ProcessId;
+    HANDLE ProcessHandle;
+    ULONG MinimumLength;
+
+    union
+    {
+        BOOLEAN Flags;
+        struct
+        {
+            BOOLEAN DetectUnicode : 1;
+            BOOLEAN Private : 1;
+            BOOLEAN Image : 1;
+            BOOLEAN Mapped : 1;
+            BOOLEAN ExtendedUnicode : 1;
+            BOOLEAN Spare : 3;
+        };
+    };
+
+    volatile CHAR EnableCloseDialog;
+    BOOLEAN ProgressBarSwitched; // UI-thread only
+
+    HWND ParentWindowHandle;
+    volatile HWND WindowHandle;
+    WNDPROC DefaultWindowProc;
+    PH_MEMORY_STRING_OPTIONS Options;
+    PPH_LIST Results;
+    volatile ULONG ResultCount;
+    volatile ULONG SearchProgressValue;
+    volatile ULONG SearchProgressMax;
+} MEMORY_STRING_CONTEXT, *PMEMORY_STRING_CONTEXT;
+
+typedef struct _MEMORY_STRING_SEARCH_CONTEXT
+{
+    PPH_MEMORY_SEARCH_OPTIONS Options;
+    HANDLE ProcessHandle;
+    ULONG TypeMask;
+    BOOLEAN DetectUnicode;
+
+    MEMORY_BASIC_INFORMATION BasicInfo;
+    PVOID CurrentReadAddress;
+    PVOID NextReadAddress;
+    SIZE_T ReadRemaning;
+    PBYTE Buffer;
+    SIZE_T BufferSize;
+} MEMORY_STRING_SEARCH_CONTEXT, *PMEMORY_STRING_SEARCH_CONTEXT;
+
+typedef struct _MEMORY_STRING_BULK_COLLECT_CONTEXT
+{
+    PPH_MEMORY_SEARCH_OPTIONS Options;
+    ULONG TypeMask;
+    PMEMORY_BASIC_INFORMATION Regions;
+    ULONG Count;
+    ULONG Capacity;
+} MEMORY_STRING_BULK_COLLECT_CONTEXT, *PMEMORY_STRING_BULK_COLLECT_CONTEXT;
+
+typedef struct _MEMORY_STRING_BULK_CONTEXT
+{
+    MEMORY_STRING_SEARCH_CONTEXT SearchContext; // must be first: shared with PhpMemoryStringSearchCallback
+    PMEMORY_BASIC_INFORMATION Regions;
+    ULONG RegionCount;
+    ULONG RegionIndex;
+    volatile ULONG *ProgressValue;
+    volatile ULONG *ProgressMax;
+} MEMORY_STRING_BULK_CONTEXT, *PMEMORY_STRING_BULK_CONTEXT;
+
+/**
+ * Window procedure for the memory string search dialog.
+ *
+ * \param hwndDlg The handle to the dialog.
+ * \param uMsg The window message.
+ * \param wParam The message-specific parameter.
+ * \param lParam The message-specific parameter.
+ * \return INT_PTR.
+ */
+INT_PTR CALLBACK PhpMemoryStringDlgProc(
+    _In_ HWND hwndDlg,
+    _In_ UINT uMsg,
+    _In_ WPARAM wParam,
+    _In_ LPARAM lParam
+    );
+
+/**
+ * Shows the memory string search progress dialog.
+ *
+ * \param Context The memory string context.
+ * \return TRUE if the search was successful, FALSE otherwise.
+ */
+BOOLEAN PhpShowMemoryStringProgressDialog(
+    _In_ PMEMORY_STRING_CONTEXT Context
+    );
+
+PVOID PhMemorySearchHeap = NULL;
+LONG PhMemorySearchHeapRefCount = 0;
+PH_QUEUED_LOCK PhMemorySearchHeapLock = PH_QUEUED_LOCK_INIT;
+
+/**
+ * Allocates memory for a memory search.
+ *
+ * \param Size The size of the memory to allocate.
+ * \return A pointer to the allocated memory, or NULL if the allocation failed.
+ */
+PVOID PhAllocateForMemorySearch(
+    _In_ SIZE_T Size
+    )
+{
+    PVOID memory;
+
+    PhAcquireQueuedLockExclusive(&PhMemorySearchHeapLock);
+
+    if (!PhMemorySearchHeap)
+    {
+        assert(PhMemorySearchHeapRefCount == 0);
+        PhMemorySearchHeap = RtlCreateHeap(
+            HEAP_GROWABLE | HEAP_CLASS_1,
+            NULL,
+            8192 * 1024, // 8 MB
+            2048 * 1024, // 2 MB
+            NULL,
+            NULL
+            );
+
+        if (PhMemorySearchHeap)
+        {
+            const ULONG defaultHeapCompatibilityMode = HEAP_COMPATIBILITY_MODE_LFH;
+            RtlSetHeapInformation(
+                PhMemorySearchHeap,
+                HeapCompatibilityInformation,
+                &defaultHeapCompatibilityMode,
+                sizeof(ULONG)
+                );
+        }
+    }
+
+    if (PhMemorySearchHeap)
+    {
+        // Don't use HEAP_NO_SERIALIZE - it's very slow on Vista and above.
+        memory = RtlAllocateHeap(PhMemorySearchHeap, 0, Size);
+
+        if (memory)
+            PhMemorySearchHeapRefCount++;
+    }
+    else
+    {
+        memory = NULL;
+    }
+
+    PhReleaseQueuedLockExclusive(&PhMemorySearchHeapLock);
+
+    return memory;
+}
+
+/**
+ * Frees memory allocated for a memory search.
+ *
+ * \param Memory A pointer to the memory to free.
+ */
+VOID PhFreeForMemorySearch(
+    _In_ _Post_invalid_ PVOID Memory
+    )
+{
+    PhAcquireQueuedLockExclusive(&PhMemorySearchHeapLock);
+
+    if (PhMemorySearchHeap)
+        RtlFreeHeap(PhMemorySearchHeap, 0, Memory);
+
+    if (--PhMemorySearchHeapRefCount == 0)
+    {
+        if (PhMemorySearchHeap)
+        {
+            RtlDestroyHeap(PhMemorySearchHeap);
+            PhMemorySearchHeap = NULL;
+        }
+    }
+
+    PhReleaseQueuedLockExclusive(&PhMemorySearchHeapLock);
+}
+
+/**
+ * Creates a new memory result.
+ *
+ * \param Address The address of the result.
+ * \param BaseAddress The base address of the memory region.
+ * \param Length The length of the result.
+ * \return A pointer to the new memory result, or NULL if the creation failed.
+ */
+PVOID PhCreateMemoryResult(
+    _In_ PVOID Address,
+    _In_ PVOID BaseAddress,
+    _In_ SIZE_T Length
+    )
+{
+    PPH_MEMORY_RESULT result;
+
+    result = PhAllocateForMemorySearch(sizeof(PH_MEMORY_RESULT));
+
+    if (!result)
+        return NULL;
+
+    result->RefCount = 1;
+    result->Address = Address;
+    result->BaseAddress = BaseAddress;
+    result->Length = Length;
+    result->Display.Length = 0;
+    result->Display.Buffer = NULL;
+
+    return result;
+}
+
+/**
+ * Increments the reference count of a memory result.
+ *
+ * \param Result A pointer to the memory result.
+ */
+VOID PhReferenceMemoryResult(
+    _In_ PPH_MEMORY_RESULT Result
+    )
+{
+    _InterlockedIncrement(&Result->RefCount);
+}
+
+/**
+ * Decrements the reference count of a memory result.
+ *
+ * \param Result A pointer to the memory result.
+ */
+VOID PhDereferenceMemoryResult(
+    _In_ PPH_MEMORY_RESULT Result
+    )
+{
+    if (_InterlockedDecrement(&Result->RefCount) == 0)
+    {
+        if (Result->Display.Buffer)
+            PhFreeForMemorySearch(Result->Display.Buffer);
+
+        PhFreeForMemorySearch(Result);
+    }
+}
+
+/**
+ * Decrements the reference count of multiple memory results.
+ *
+ * \param Results An array of memory results.
+ * \param NumberOfResults The number of memory results in the array.
+ */
+VOID PhDereferenceMemoryResults(
+    _In_reads_(NumberOfResults) PPH_MEMORY_RESULT *Results,
+    _In_ ULONG NumberOfResults
+    )
+{
+    for (ULONG i = 0; i < NumberOfResults; i++)
+        PhDereferenceMemoryResult(Results[i]);
+}
+
+/**
+ * Callback function for reading the next buffer during a memory string search.
+ *
+ * \param Buffer A variable which receives a pointer to the buffer.
+ * \param Length A variable which receives the length of the buffer.
+ * \param Context The search context.
+ * \return NTSTATUS.
+ */
+_Function_class_(PH_STRING_SEARCH_NEXT_BUFFER)
+NTSTATUS NTAPI PhpMemoryStringSearchNextBuffer(
+    _Inout_bytecount_(*Length) PVOID* Buffer,
+    _Out_ PSIZE_T Length,
+    _In_opt_ PVOID Context
+    )
+{
+    NTSTATUS status = STATUS_SUCCESS;
+    PMEMORY_STRING_SEARCH_CONTEXT context;
+
+    assert(Context);
+    context = Context;
+    *Buffer = NULL;
+    *Length = 0;
+
+    if (context->ReadRemaning)
+    {
+        if (context->Options->Cancel)
+            return status;
+        goto ReadMemory;
+    }
+
+    while (NT_SUCCESS(status = NtQueryVirtualMemory(
+        context->ProcessHandle,
+        PTR_ADD_OFFSET(context->BasicInfo.BaseAddress, context->BasicInfo.RegionSize),
+        MemoryBasicInformation,
+        &context->BasicInfo,
+        sizeof(MEMORY_BASIC_INFORMATION),
+        NULL
+        )))
+    {
+        SIZE_T length;
+
+        if (context->Options->Cancel)
+            break;
+        if (context->BasicInfo.State != MEM_COMMIT)
+            continue;
+        if (FlagOn(context->BasicInfo.Protect, PAGE_NOACCESS | PAGE_GUARD))
+            continue;
+        if (!FlagOn(context->BasicInfo.Type, context->TypeMask))
+            continue;
+
+        context->NextReadAddress = context->BasicInfo.BaseAddress;
+        context->ReadRemaning = context->BasicInfo.RegionSize;
+
+        // Don't allocate a huge buffer (16 MiB max)
+        length = min(context->BasicInfo.RegionSize, 16 * 1024 * 1024);
+
+        if (length > context->BufferSize)
+        {
+            context->Buffer = PhReAllocate(context->Buffer, length);
+            context->BufferSize = length;
+        }
+
+        if (context->ReadRemaning)
+        {
+ReadMemory:
+            context->CurrentReadAddress = context->NextReadAddress;
+            length = min(context->ReadRemaning, context->BufferSize);
+
+            if (NT_SUCCESS(status = PhReadVirtualMemory(
+                context->ProcessHandle,
+                context->CurrentReadAddress,
+                context->Buffer,
+                length,
+                &length
+                )))
+            {
+                *Buffer = context->Buffer;
+                *Length = length;
+                context->ReadRemaning -= length;
+                context->NextReadAddress = PTR_ADD_OFFSET(context->NextReadAddress, length);
+                break;
+            }
+        }
+
+        context->NextReadAddress = NULL;
+        context->ReadRemaning = 0;
+    }
+
+    return status;
+}
+
+/**
+ * Callback function for processing a memory string search result.
+ *
+ * \param Result The search result.
+ * \param Context The search context.
+ * \return TRUE to continue the search, FALSE to stop.
+ */
+_Function_class_(PH_STRING_SEARCH_CALLBACK)
+BOOLEAN NTAPI PhpMemoryStringSearchCallback(
+    _In_ PPH_STRING_SEARCH_RESULT Result,
+    _In_opt_ PVOID Context
+    )
+{
+    PMEMORY_STRING_SEARCH_CONTEXT context = Context;
+    PPH_MEMORY_RESULT result;
+
+    assert(context);
+
+    if (!context->DetectUnicode && Result->Encoding == PH_STRING_SEARCH_ENCODING_UTF16)
+        return context->Options->Cancel;
+
+    result = PhCreateMemoryResult(
+        PTR_ADD_OFFSET(context->CurrentReadAddress, PTR_SUB_OFFSET(Result->Address, context->Buffer)),
+        context->BasicInfo.BaseAddress,
+        Result->Length
+        );
+
+    if (!result)
+        return context->Options->Cancel;
+
+    result->Display.Buffer = PhAllocateForMemorySearch(Result->String.Length + sizeof(WCHAR));
+
+    if (!result->Display.Buffer)
+    {
+        PhDereferenceMemoryResult(result);
+        return context->Options->Cancel;
+    }
+
+    memcpy(result->Display.Buffer, Result->String.Buffer, Result->String.Length);
+    result->Display.Buffer[Result->String.Length / sizeof(WCHAR)] = UNICODE_NULL;
+    result->Display.Length = Result->String.Length;
+
+    context->Options->Callback(result, context->Options->Context);
+
+    return context->Options->Cancel;
+}
+
+/**
+ * Callback function for enumerating memory regions for a bulk search.
+ *
+ * \param ProcessHandle The process handle.
+ * \param BasicInfo An array of memory basic information structures.
+ * \param Count The number of structures in the array.
+ * \param Context The bulk search collection context.
+ * \return NTSTATUS.
+ */
+_Function_class_(PH_ENUM_MEMORY_BULK_CALLBACK)
+NTSTATUS NTAPI PhpMemoryStringBulkEnumCallback(
+    _In_ HANDLE ProcessHandle,
+    _In_ PMEMORY_BASIC_INFORMATION BasicInfo,
+    _In_ SIZE_T Count,
+    _In_opt_ PVOID Context
+    )
+{
+    PMEMORY_STRING_BULK_COLLECT_CONTEXT context = Context;
+
+    assert(context);
+
+    for (SIZE_T i = 0; i < Count; i++)
+    {
+        if (context->Options->Cancel)
+            return STATUS_CANCELLED;
+        if (BasicInfo[i].State != MEM_COMMIT)
+            continue;
+        if (FlagOn(BasicInfo[i].Protect, PAGE_NOACCESS | PAGE_GUARD))
+            continue;
+        if (!FlagOn(BasicInfo[i].Type, context->TypeMask))
+            continue;
+
+        if (context->Count >= context->Capacity)
+        {
+            context->Capacity = context->Capacity ? context->Capacity * 2 : 256;
+            context->Regions = PhReAllocate(context->Regions, context->Capacity * sizeof(MEMORY_BASIC_INFORMATION));
+        }
+
+        context->Regions[context->Count++] = BasicInfo[i];
+    }
+
+    return STATUS_SUCCESS;
+}
+
+/**
+ * Callback function for reading the next buffer during a bulk memory string search.
+ *
+ * \param Buffer A variable which receives a pointer to the buffer.
+ * \param Length A variable which receives the length of the buffer.
+ * \param Context The bulk search context.
+ * \return NTSTATUS.
+ */
+_Function_class_(PH_STRING_SEARCH_NEXT_BUFFER)
+_Must_inspect_result_
+NTSTATUS NTAPI PhpMemoryStringBulkNextBuffer(
+    _Inout_bytecount_(*Length) PVOID* Buffer,
+    _Out_ PSIZE_T Length,
+    _In_opt_ PVOID Context
+    )
+{
+    NTSTATUS status = STATUS_SUCCESS;
+    PMEMORY_STRING_BULK_CONTEXT context;
+    PMEMORY_STRING_SEARCH_CONTEXT searchContext;
+    SIZE_T length;
+
+    assert(Context);
+    context = Context;
+    searchContext = &context->SearchContext;
+    *Buffer = NULL;
+    *Length = 0;
+
+    if (searchContext->ReadRemaning)
+    {
+        if (searchContext->Options->Cancel)
+            return status;
+        goto ReadMemory;
+    }
+
+    while (context->RegionIndex < context->RegionCount)
+    {
+        if (searchContext->Options->Cancel)
+            break;
+
+        searchContext->BasicInfo = context->Regions[context->RegionIndex++];
+        searchContext->NextReadAddress = searchContext->BasicInfo.BaseAddress;
+        searchContext->ReadRemaning = searchContext->BasicInfo.RegionSize;
+
+        if (context->ProgressValue)
+            InterlockedExchange((PLONG)context->ProgressValue, (LONG)context->RegionIndex);
+
+        length = __min(searchContext->BasicInfo.RegionSize, 16 * 1024 * 1024);
+
+        if (length > searchContext->BufferSize)
+        {
+            searchContext->Buffer = PhReAllocate(searchContext->Buffer, length);
+            searchContext->BufferSize = length;
+        }
+
+        if (searchContext->ReadRemaning)
+        {
+ReadMemory:
+            searchContext->CurrentReadAddress = searchContext->NextReadAddress;
+            length = __min(searchContext->ReadRemaning, searchContext->BufferSize);
+
+            if (NT_SUCCESS(status = PhReadVirtualMemory(
+                searchContext->ProcessHandle,
+                searchContext->CurrentReadAddress,
+                searchContext->Buffer,
+                length,
+                &length
+                )))
+            {
+                *Buffer = searchContext->Buffer;
+                *Length = length;
+                searchContext->ReadRemaning -= length;
+                searchContext->NextReadAddress = PTR_ADD_OFFSET(searchContext->NextReadAddress, length);
+                return status;
+            }
+        }
+
+        searchContext->NextReadAddress = NULL;
+        searchContext->ReadRemaning = 0;
+    }
+
+    return status;
+}
+
+/**
+ * Searches for strings in the memory of a process.
+ *
+ * \param ProcessHandle The process handle.
+ * \param Options The memory string search options.
+ */
+VOID PhSearchMemoryString(
+    _In_ HANDLE ProcessHandle,
+    _In_ PPH_MEMORY_STRING_OPTIONS Options
+    )
+{
+    MEMORY_STRING_BULK_COLLECT_CONTEXT collectContext;
+
+    memset(&collectContext, 0, sizeof(MEMORY_STRING_BULK_COLLECT_CONTEXT));
+    collectContext.Options = &Options->Header;
+    collectContext.TypeMask = Options->MemoryTypeMask;
+
+    if (PhGetIntegerSetting(SETTING_ENABLE_MEM_STRINGS_BULK_SEARCH) && NT_SUCCESS(PhEnumVirtualMemoryBulk(
+        ProcessHandle,
+        NULL,
+        FALSE,
+        PhpMemoryStringBulkEnumCallback,
+        &collectContext
+        )))
+    {
+        MEMORY_STRING_BULK_CONTEXT bulkContext;
+
+        memset(&bulkContext, 0, sizeof(MEMORY_STRING_BULK_CONTEXT));
+        bulkContext.SearchContext.Options = &Options->Header;
+        bulkContext.SearchContext.ProcessHandle = ProcessHandle;
+        bulkContext.SearchContext.DetectUnicode = Options->DetectUnicode;
+        bulkContext.Regions = collectContext.Regions;
+        bulkContext.RegionCount = collectContext.Count;
+        bulkContext.ProgressValue = Options->ProgressValue;
+        bulkContext.ProgressMax = Options->ProgressMax;
+        if (Options->ProgressMax)
+            InterlockedExchange((PLONG)Options->ProgressMax, (LONG)collectContext.Count);
+
+        PhSearchStrings(
+            Options->MinimumLength,
+            Options->ExtendedUnicode,
+            PhpMemoryStringBulkNextBuffer,
+            PhpMemoryStringSearchCallback,
+            &bulkContext.SearchContext
+            );
+
+        if (bulkContext.SearchContext.Buffer)
+            PhFree(bulkContext.SearchContext.Buffer);
+    }
+    else
+    {
+        MEMORY_STRING_SEARCH_CONTEXT context;
+
+        memset(&context, 0, sizeof(MEMORY_STRING_SEARCH_CONTEXT));
+        context.Options = &Options->Header;
+        context.ProcessHandle = ProcessHandle;
+        context.TypeMask = Options->MemoryTypeMask;
+        context.DetectUnicode = Options->DetectUnicode;
+
+        PhSearchStrings(
+            Options->MinimumLength,
+            Options->ExtendedUnicode,
+            PhpMemoryStringSearchNextBuffer,
+            PhpMemoryStringSearchCallback,
+            &context
+            );
+
+        if (context.Buffer)
+            PhFree(context.Buffer);
+    }
+
+    if (collectContext.Regions)
+        PhFree(collectContext.Regions);
+}
+
+/**
+ * Shows the memory string search dialog.
+ *
+ * \param ParentWindowHandle The handle to the parent window.
+ * \param ProcessItem The process item.
+ */
+VOID PhShowMemoryStringDialog(
+    _In_ HWND ParentWindowHandle,
+    _In_ PPH_PROCESS_ITEM ProcessItem
+    )
+{
+    NTSTATUS status;
+    HANDLE processHandle;
+    MEMORY_STRING_CONTEXT context;
+
+    if (!NT_SUCCESS(status = PhOpenProcess(
+        &processHandle,
+        PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
+        ProcessItem->ProcessId
+        )))
+    {
+        PhShowStatus(ParentWindowHandle, L"Unable to open the process", status, 0);
+        return;
+    }
+
+    memset(&context, 0, sizeof(MEMORY_STRING_CONTEXT));
+    context.ParentWindowHandle = ParentWindowHandle;
+    context.ProcessId = ProcessItem->ProcessId;
+    context.ProcessHandle = processHandle;
+
+    if (PhDialogBox(
+        PhInstanceHandle,
+        MAKEINTRESOURCE(IDD_MEMSTRING),
+        ParentWindowHandle,
+        PhpMemoryStringDlgProc,
+        &context
+        ) != IDOK)
+    {
+        NtClose(processHandle);
+        return;
+    }
+
+    context.Results = PhCreateList(1024);
+
+    if (PhpShowMemoryStringProgressDialog(&context))
+    {
+        PPH_SHOW_MEMORY_RESULTS showMemoryResults;
+
+        showMemoryResults = PhAllocate(sizeof(PH_SHOW_MEMORY_RESULTS));
+        showMemoryResults->ProcessId = ProcessItem->ProcessId;
+        showMemoryResults->Results = context.Results;
+
+        PhReferenceObject(context.Results);
+        SystemInformer_ShowMemoryResults(showMemoryResults);
+    }
+    else
+    {
+        PhDereferenceMemoryResults(
+            (PPH_MEMORY_RESULT*)context.Results->Items,
+            context.Results->Count
+            );
+    }
+
+    PhDereferenceObject(context.Results);
+    NtClose(processHandle);
+}
+
+/**
+ * Window procedure for the memory string search dialog.
+ *
+ * \param hwndDlg The handle to the dialog.
+ * \param uMsg The window message.
+ * \param wParam The message-specific parameter.
+ * \param lParam The message-specific parameter.
+ * \return INT_PTR.
+ */
+INT_PTR CALLBACK PhpMemoryStringDlgProc(
+    _In_ HWND hwndDlg,
+    _In_ UINT uMsg,
+    _In_ WPARAM wParam,
+    _In_ LPARAM lParam
+    )
+{
+    PMEMORY_STRING_CONTEXT context;
+
+    if (uMsg == WM_INITDIALOG)
+    {
+        context = (PMEMORY_STRING_CONTEXT)lParam;
+
+        PhSetWindowContext(hwndDlg, PH_WINDOW_CONTEXT_DEFAULT, context);
+    }
+    else
+    {
+        context = PhGetWindowContext(hwndDlg, PH_WINDOW_CONTEXT_DEFAULT);
+    }
+
+    if (!context)
+        return FALSE;
+
+    switch (uMsg)
+    {
+    case WM_INITDIALOG:
+        {
+            PhCenterWindow(hwndDlg, GetParent(hwndDlg));
+
+            PhSetDialogItemText(hwndDlg, IDC_MINIMUMLENGTH, L"10");
+            Button_SetCheck(GetDlgItem(hwndDlg, IDC_DETECTUNICODE), BST_CHECKED);
+            Button_SetCheck(GetDlgItem(hwndDlg, IDC_PRIVATE), BST_CHECKED);
+
+            PhInitializeWindowTheme(hwndDlg, PhEnableThemeSupport);
+        }
+        break;
+    case WM_DESTROY:
+        {
+            PhRemoveWindowContext(hwndDlg, PH_WINDOW_CONTEXT_DEFAULT);
+        }
+        break;
+    case WM_COMMAND:
+        {
+            switch (GET_WM_COMMAND_ID(wParam, lParam))
+            {
+            case IDCANCEL:
+                EndDialog(hwndDlg, IDCANCEL);
+                break;
+            case IDOK:
+                {
+                    ULONG64 minimumLength = 10;
+
+                    PhStringToInteger64(&PhaGetDlgItemText(hwndDlg, IDC_MINIMUMLENGTH)->sr, 0, &minimumLength);
+
+                    if (minimumLength < 4)
+                    {
+                        PhShowError2(hwndDlg, L"Unable to search for strings.", L"%s", L"The minimum length must be at least 4.");
+                        break;
+                    }
+
+                    context->MinimumLength = (ULONG)minimumLength;
+                    context->DetectUnicode = Button_GetCheck(GetDlgItem(hwndDlg, IDC_DETECTUNICODE)) == BST_CHECKED;
+                    context->ExtendedUnicode = Button_GetCheck(GetDlgItem(hwndDlg, IDC_EXTENDEDUNICODE)) == BST_CHECKED;
+                    context->Private = Button_GetCheck(GetDlgItem(hwndDlg, IDC_PRIVATE)) == BST_CHECKED;
+                    context->Image = Button_GetCheck(GetDlgItem(hwndDlg, IDC_IMAGE)) == BST_CHECKED;
+                    context->Mapped = Button_GetCheck(GetDlgItem(hwndDlg, IDC_MAPPED)) == BST_CHECKED;
+
+                    if (!context->Private && !context->Image && !context->Mapped)
+                    {
+                        PhShowError2(hwndDlg, L"Unable to search for strings.", L"%s", L"At least one memory type (Private, Image, or Mapped) must be selected.");
+                        break;
+                    }
+
+                    EndDialog(hwndDlg, IDOK);
+                }
+                break;
+            case IDC_DETECTUNICODE:
+                {
+                    HWND windowHandle = GetDlgItem(hwndDlg, IDC_EXTENDEDUNICODE);
+
+                    if (Button_GetCheck(GetDlgItem(hwndDlg, IDC_DETECTUNICODE)) == BST_UNCHECKED)
+                    {
+                        Button_SetCheck(windowHandle, BST_UNCHECKED);
+                        Button_Enable(windowHandle, FALSE);
+                    }
+                    else
+                    {
+                        Button_Enable(windowHandle, TRUE);
+                    }
+                }
+                break;
+            }
+        }
+        break;
+    case WM_CTLCOLORBTN:
+        return HANDLE_WM_CTLCOLORBTN(hwndDlg, wParam, lParam, PhWindowThemeControlColor);
+    case WM_CTLCOLORDLG:
+        return HANDLE_WM_CTLCOLORDLG(hwndDlg, wParam, lParam, PhWindowThemeControlColor);
+    case WM_CTLCOLORSTATIC:
+        return HANDLE_WM_CTLCOLORSTATIC(hwndDlg, wParam, lParam, PhWindowThemeControlColor);
+    }
+
+    return FALSE;
+}
+
+/**
+ * Callback function for receiving memory string search results.
+ *
+ * \param Result The memory result.
+ * \param Context The memory string context.
+ */
+static VOID NTAPI PhpMemoryStringResultCallback(
+    _In_ _Assume_refs_(1) PPH_MEMORY_RESULT Result,
+    _In_opt_ PVOID Context
+    )
+{
+    PMEMORY_STRING_CONTEXT context = Context;
+
+    if (context && context->Results)
+    {
+        PhAddItemList(context->Results, Result);
+        InterlockedIncrement((PLONG)&context->ResultCount);
+    }
+}
+
+/**
+ * Thread start routine for the memory string search thread.
+ *
+ * \param Parameter The memory string context.
+ * \return NTSTATUS.
+ */
+_Function_class_(USER_THREAD_START_ROUTINE)
+NTSTATUS PhpMemoryStringThreadStart(
+    _In_ PVOID Parameter
+    )
+{
+    PMEMORY_STRING_CONTEXT context = Parameter;
+
+    context->Options.Header.Callback = PhpMemoryStringResultCallback;
+    context->Options.Header.Context = context;
+    context->Options.MinimumLength = context->MinimumLength;
+    context->Options.DetectUnicode = context->DetectUnicode;
+    context->Options.ExtendedUnicode = context->ExtendedUnicode;
+    context->Options.ProgressValue = &context->SearchProgressValue;
+    context->Options.ProgressMax = &context->SearchProgressMax;
+
+    if (context->Private)
+        context->Options.MemoryTypeMask |= MEM_PRIVATE;
+    if (context->Image)
+        context->Options.MemoryTypeMask |= MEM_IMAGE;
+    if (context->Mapped)
+        context->Options.MemoryTypeMask |= MEM_MAPPED;
+
+    PhSearchMemoryString(context->ProcessHandle, &context->Options);
+
+    SendMessage(
+        context->WindowHandle,
+        WM_PH_MEMORY_STATUS_UPDATE,
+        PH_SEARCH_COMPLETED,
+        0
+        );
+
+    return STATUS_SUCCESS;
+}
+
+/**
+ * Subclass procedure for the memory string search progress task dialog.
+ *
+ * \param hwndDlg The handle to the task dialog.
+ * \param uMsg The window message.
+ * \param wParam The message-specific parameter.
+ * \param lParam The message-specific parameter.
+ * \return LRESULT.
+ */
+LRESULT CALLBACK PhpMemoryStringTaskDialogSubclassProc(
+    _In_ HWND hwndDlg,
+    _In_ UINT uMsg,
+    _In_ WPARAM wParam,
+    _In_ LPARAM lParam
+    )
+{
+    PMEMORY_STRING_CONTEXT context;
+    WNDPROC oldWndProc;
+
+    if (!(context = PhGetWindowContext(hwndDlg, 0xF)))
+        return 0;
+
+    oldWndProc = context->DefaultWindowProc;
+
+    switch (uMsg)
+    {
+    case WM_DESTROY:
+        {
+            PhSetWindowProcedure(hwndDlg, oldWndProc);
+            PhRemoveWindowContext(hwndDlg, 0xF);
+        }
+        break;
+    case WM_PH_MEMORY_STATUS_UPDATE:
+        {
+            switch (wParam)
+            {
+            case PH_SEARCH_COMPLETED:
+                {
+                    _InterlockedOr8(&context->EnableCloseDialog, 1);
+                    SendMessage(hwndDlg, TDM_CLICK_BUTTON, IDOK, 0);
+                }
+                break;
+            }
+        }
+        break;
+    }
+
+    return CallWindowProc(oldWndProc, hwndDlg, uMsg, wParam, lParam);
+}
+
+/**
+ * Callback function for the memory string search progress task dialog.
+ *
+ * \param hwndDlg The handle to the task dialog.
+ * \param uMsg The callback message.
+ * \param wParam The message-specific parameter.
+ * \param lParam The message-specific parameter.
+ * \param dwRefData The memory string context.
+ * \return HRESULT.
+ */
+HRESULT CALLBACK PhpMemoryStringTaskDialogCallback(
+    _In_ HWND hwndDlg,
+    _In_ UINT uMsg,
+    _In_ WPARAM wParam,
+    _In_ LPARAM lParam,
+    _In_ LONG_PTR dwRefData
+    )
+{
+    PMEMORY_STRING_CONTEXT context = (PMEMORY_STRING_CONTEXT)dwRefData;
+
+    switch (uMsg)
+    {
+    case TDN_CREATED:
+        {
+            context->WindowHandle = hwndDlg;
+
+            // Create the Taskdialog icons.
+            PhSetApplicationWindowIcon(hwndDlg);
+            SendMessage(hwndDlg, TDM_UPDATE_ICON, TDIE_ICON_MAIN, (LPARAM)PhGetApplicationIcon(FALSE, PhGetWindowDpi(hwndDlg)));
+
+            // Set the progress state.
+            SendMessage(hwndDlg, TDM_SET_MARQUEE_PROGRESS_BAR, TRUE, 0);
+            SendMessage(hwndDlg, TDM_SET_PROGRESS_BAR_MARQUEE, TRUE, 1);
+
+            // Subclass the Taskdialog.
+            context->DefaultWindowProc = PhGetWindowProcedure(hwndDlg);
+            PhSetWindowContext(hwndDlg, 0xF, context);
+            PhSetWindowProcedure(hwndDlg, PhpMemoryStringTaskDialogSubclassProc);
+
+            // Create the search thread.
+            {
+                NTSTATUS status;
+
+                status = PhCreateThread2(PhpMemoryStringThreadStart, context);
+
+                if (!NT_SUCCESS(status))
+                {
+                    PhShowStatus(hwndDlg, L"Unable to create the search thread", status, 0);
+                    SendMessage(hwndDlg, TDM_CLICK_BUTTON, IDCANCEL, 0);
+                }
+            }
+        }
+        break;
+    case TDN_BUTTON_CLICKED:
+        {
+            if ((INT)wParam == IDCANCEL)
+                _InterlockedOr8((volatile CHAR*)&context->Options.Header.Cancel, 1);
+
+            if (!context->EnableCloseDialog)
+                return S_FALSE;
+        }
+        break;
+    case TDN_TIMER:
+        {
+            PPH_STRING numberText;
+            PPH_STRING progressText;
+            ULONG progressMax;
+            ULONG progressValue;
+
+            if (!context->Results)
+                break;
+
+            progressMax = context->SearchProgressMax;
+            progressValue = context->SearchProgressValue;
+
+            if (progressMax > 0)
+            {
+                if (!context->ProgressBarSwitched)
+                {
+                    SendMessage(hwndDlg, TDM_SET_MARQUEE_PROGRESS_BAR, FALSE, 0);
+                    SendMessage(hwndDlg, TDM_SET_PROGRESS_BAR_MARQUEE, FALSE, 0);
+                    SendMessage(hwndDlg, TDM_SET_PROGRESS_BAR_RANGE, 0, MAKELPARAM(0, 100));
+                    context->ProgressBarSwitched = TRUE;
+                }
+
+                SendMessage(hwndDlg, TDM_SET_PROGRESS_BAR_POS,
+                    (WPARAM)((progressValue < progressMax) ? PhMultiplyDivide(progressValue, 100, progressMax) : 100), 0);
+            }
+
+            numberText = PhFormatUInt64(context->ResultCount, TRUE);
+            progressText = PhFormatString(L"%s strings found...", numberText->Buffer);
+
+            SendMessage(hwndDlg, TDM_SET_ELEMENT_TEXT, TDE_CONTENT, (LPARAM)progressText->Buffer);
+
+            PhDereferenceObject(progressText);
+            PhDereferenceObject(numberText);
+        }
+        break;
+    }
+
+    return S_OK;
+}
+
+/**
+ * Shows the memory string search progress dialog.
+ *
+ * \param Context The memory string context.
+ * \return TRUE if the search was successful, FALSE otherwise.
+ */
+BOOLEAN PhpShowMemoryStringProgressDialog(
+    _In_ PMEMORY_STRING_CONTEXT Context
+    )
+{
+    TASKDIALOGCONFIG config;
+    INT result = 0;
+
+    memset(&config, 0, sizeof(TASKDIALOGCONFIG));
+    config.cbSize = sizeof(TASKDIALOGCONFIG);
+    config.dwFlags = TDF_USE_HICON_MAIN | TDF_ALLOW_DIALOG_CANCELLATION | TDF_POSITION_RELATIVE_TO_WINDOW | TDF_SHOW_MARQUEE_PROGRESS_BAR | TDF_CALLBACK_TIMER;
+    config.dwCommonButtons = TDCBF_CANCEL_BUTTON;
+    config.pfCallback = PhpMemoryStringTaskDialogCallback;
+    config.lpCallbackData = (LONG_PTR)Context;
+    config.hwndParent = Context->ParentWindowHandle;
+    config.pszWindowTitle = PhApplicationName;
+    config.pszMainInstruction = L"Searching memory strings...";
+    config.pszContent = L" ";
+    config.cxWidth = 200;
+
+    if (SUCCEEDED(TaskDialogIndirect(&config, &result, NULL, NULL)) && result == IDOK)
+    {
+        return TRUE;
+    }
+
+    return FALSE;
+}

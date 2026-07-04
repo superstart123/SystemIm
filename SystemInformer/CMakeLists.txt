@@ -1,0 +1,258 @@
+#
+# Copyright (c) 2022 Winsider Seminars & Solutions, Inc.  All rights reserved.
+#
+# This file is part of System Informer.
+#
+
+set(HEADERS
+    "include/actions.h"
+    "include/appsup.h"
+    "include/colmgr.h"
+    "include/colsetmgr.h"
+    "include/devprv.h"
+    "include/extmgr.h"
+    "include/extmgri.h"
+    "include/heapstruct.h"
+    "include/hidnproc.h"
+    "include/hndllist.h"
+    "include/hndlmenu.h"
+    "include/hndlprv.h"
+    "include/informer.h"
+    "include/ksisup.h"
+    "include/mainwnd.h"
+    "include/mainwndp.h"
+    "include/memlist.h"
+    "include/memprv.h"
+    "include/memsrch.h"
+    "include/miniinfo.h"
+    "include/miniinfop.h"
+    "include/modlist.h"
+    "include/modprv.h"
+    "include/netlist.h"
+    "include/netprv.h"
+    "include/notifico.h"
+    "include/notificop.h"
+    "include/notiftoast.h"
+    "include/phapp.h"
+    "include/phappres.h"
+    "include/phfwddef.h"
+    "include/phplug.h"
+    "include/phsettings.h"
+    "include/phsvc.h"
+    "include/phsvcapi.h"
+    "include/phsvccl.h"
+    "include/phuisup.h"
+    "include/procgrp.h"
+    "include/procmtgn.h"
+    "include/procprp.h"
+    "include/procprpp.h"
+    "include/procprv.h"
+    "include/proctree.h"
+    "include/srvlist.h"
+    "include/srvprv.h"
+    "include/sysinfo.h"
+    "include/sysinfop.h"
+    "include/thrdlist.h"
+    "include/thrdprv.h"
+    "resource.h"
+    "sdk/phdk.h"
+)
+source_group("Header Files" FILES ${HEADERS})
+
+set(RESOURCES
+    "version.rc"
+    "SystemInformer.def"
+    "SystemInformer.rc"
+    "SystemInformer.manifest"
+    "resources/application.ico"
+    "resources/capslist.txt"
+    "resources/case_sensitive_modern_dark.svg"
+    "resources/case_sensitive_modern_light.svg"
+    "resources/cog.ico"
+    "resources/etwguids.txt"
+    "resources/pooltag.txt"
+    "resources/regex_modern_dark.svg"
+    "resources/regex_modern_light.svg"
+    "resources/search_modern_dark.svg"
+    "resources/search_modern_light.svg"
+    "resources/search_stop_modern_dark.svg"
+    "resources/search_stop_modern_light.svg"
+    "resources/systeminformer.png"
+    "SystemInformer.ico"
+)
+source_group("Resource Files" FILES ${RESOURCES})
+
+set(SOURCES
+    "about.c"
+    "actions.c"
+    "admintask.c"
+    "affinity.c"
+    "anawait.c"
+    "appsup.c"
+    "chcol.c"
+    "chdlg.c"
+    "chproc.c"
+    "colmgr.c"
+    "colsetmgr.c"
+    "dbgcon.c"
+    "delayhook.c"
+    "delayload.c"
+    "devprv.c"
+    "extmgr.c"
+    "findobj.c"
+    "gdihndl.c"
+    "heapinfo.c"
+    "hidnproc.c"
+    "hndllist.c"
+    "hndlmenu.c"
+    "hndlprp.c"
+    "hndlprv.c"
+    "hndlstat.c"
+    "infodlg.c"
+    "informer.c"
+    "informerwnd.c"
+    "itemtips.c"
+    "jobprp.c"
+    "kdump.c"
+    "ksisup.c"
+    "ksyscall.c"
+    "log.c"
+    "logwnd.c"
+    "main.c"
+    "mainwnd.c"
+    "mdump.c"
+    "memedit.c"
+    "memlist.c"
+    "memlists.c"
+    "memmod.c"
+    "memprot.c"
+    "memprv.c"
+    "memrslt.c"
+    "memsrch.c"
+    "memsrcht.c"
+    "miniinfo.c"
+    "modlist.c"
+    "modprv.c"
+    "mtgndlg.c"
+    "mwpgdev.c"
+    "mwpgnet.c"
+    "mwpgproc.c"
+    "mwpgsrv.c"
+    "netlist.c"
+    "netprv.c"
+    "netsup.c"
+    "notifico.c"
+    "notiftoast.cpp"
+    "ntobjprp.c"
+    "options.c"
+    "pagfiles.c"
+    "plugin.c"
+    "plugman.c"
+    "procgrp.c"
+    "procmtgn.c"
+    "procprp.c"
+    "procprv.c"
+    "procrec.c"
+    "proctree.c"
+    "prpgenv.c"
+    "prpggen.c"
+    "prpghndl.c"
+    "prpgjob.c"
+    "prpgmem.c"
+    "prpgmod.c"
+    "prpgperf.c"
+    "prpgsrv.c"
+    "prpgstat.c"
+    "prpgthrd.c"
+    "prpgtok.c"
+    "prpgvdm.c"
+    "prpgwmi.c"
+    "runas.c"
+    "runaspkg.c"
+    "searchbox.c"
+    "sessmsg.c"
+    "sessprp.c"
+    "sessshad.c"
+    "settings.c"
+    "srvcr.c"
+    "srvctl.c"
+    "srvlist.c"
+    "srvprp.c"
+    "srvprv.c"
+    "sysinfo.c"
+    "syssccpu.c"
+    "sysscio.c"
+    "sysscmem.c"
+    "thrdlist.c"
+    "thrdprv.c"
+    "thrdstk.c"
+    "thrdstks.c"
+    "tokprp.c"
+    "usrlist.c"
+    "phsvc/clapi.c"
+    "phsvc/svcapi.c"
+    "phsvc/svcapiport.c"
+    "phsvc/svcclient.c"
+    "phsvc/svcmain.c"
+)
+source_group("Source Files" FILES ${SOURCES})
+
+set(ALL_FILES
+    ${HEADERS}
+    ${RESOURCES}
+    ${SOURCES}
+)
+
+si_add_executable(SystemInformer WIN32 ${ALL_FILES})
+
+set_target_properties(SystemInformer PROPERTIES ENABLE_EXPORTS TRUE OUTPUT_NAME mythic)
+
+target_include_directories(SystemInformer PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/include"
+)
+
+target_include_directories(SystemInformer INTERFACE
+    "${SI_ROOT}/phnt/include"
+    "${SI_ROOT}/sdk/include/$<CONFIG>${SI_PLATFORM_SHORT}"
+)
+
+target_compile_definitions(SystemInformer PRIVATE
+    _PHAPP_
+)
+
+target_link_libraries(SystemInformer PRIVATE
+    phnt
+    phlib
+    kphlib_um
+    delayimp
+    user32
+    gdi32
+    comdlg32
+    advapi32
+    ole32
+    oleaut32
+    setupapi
+    cfgmgr32
+    aclui
+    comctl32
+    dnsapi
+    ntdll
+    userenv
+    wbemuuid
+    windowscodecs
+    winhttp
+    winsta
+)
+
+target_link_options(SystemInformer PRIVATE
+    /DELAYLOAD:setupapi.dll
+    /DELAYLOAD:cfgmgr32.dll
+    /DELAYLOAD:aclui.dll
+    /DELAYLOAD:comdlg32.dll
+    /DELAYLOAD:gdiplus.dll
+    /DELAYLOAD:oleaut32.dll
+    /DELAYLOAD:winhttp.dll
+    /DELAYLOAD:winsta.dll
+)
+
+si_sdkbuild(SystemInformer)

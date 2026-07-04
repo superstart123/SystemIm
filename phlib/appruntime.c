@@ -1,0 +1,1698 @@
+/*
+ * Copyright (c) 2022 Winsider Seminars & Solutions, Inc.  All rights reserved.
+ *
+ * This file is part of System Informer.
+ *
+ * Authors:
+ *
+ *     dmex    2023-2026
+ *
+ */
+
+#include <ph.h>
+#include <mapldr.h>
+#include <appresolver.h>
+
+#if defined(PH_NATIVE_WINDOWS_RUNTIME_STRING)
+#pragma comment(lib, "runtimeobject.lib")
+#include <roapi.h>
+#include <winstring.h>
+#endif
+
+#ifdef __hstring_h__
+static_assert(sizeof(HSTRING_REFERENCE) == sizeof(HSTRING_HEADER), "HSTRING_REFERENCE must equal HSTRING_HEADER");
+#else
+static_assert(sizeof(HSTRING_REFERENCE) == sizeof(WSTRING_HEADER), "HSTRING_REFERENCE must equal WSTRING_HEADER");
+#endif
+
+/**
+ * Creates a string from a Windows Runtime string.
+ *
+ * \param String The Windows Runtime string.
+ * \return A pointer to the created string.
+ */
+PPH_STRING PhCreateStringFromWindowsRuntimeString(
+    _In_ HSTRING String
+    )
+{
+#if defined(PH_NATIVE_WINDOWS_RUNTIME_STRING)
+    UINT32 stringLength;
+    PCWSTR string;
+
+    if (string = PhGetWindowsRuntimeStringBuffer(String, &stringLength))
+    {
+        if (stringLength >= sizeof(UNICODE_NULL))
+        {
+            return PhCreateStringEx(string, stringLength * sizeof(WCHAR));
+        }
+    }
+#else
+    HSTRING_INSTANCE* string = (HSTRING_INSTANCE*)String;
+
+    if (string && string->Length >= sizeof(UNICODE_NULL))
+    {
+        return PhCreateStringEx(string->Buffer, string->Length * sizeof(WCHAR));
+    }
+#endif
+
+    return PhReferenceEmptyString();
+}
+
+// rev from WindowsCreateStringReference (dmex)
+/**
+ * \brief Creates a new string reference based on the specified string.
+ *
+ * \param SourceString A null-terminated string to use as the source for the new string.
+ * \param String A pointer to the newly created string.
+ * \return Successful or errant status.
+ */
+HRESULT PhCreateWindowsRuntimeStringReference(
+    _In_ PCWSTR SourceString,
+    _Out_ PVOID String
+    )
+{
+#if defined(PH_NATIVE_WINDOWS_RUNTIME_STRING)
+    HSTRING stringHandle;
+
+    return WindowsCreateStringReference(
+        SourceString,
+        (UINT32)PhCountStringZ(SourceString),
+        String,
+        &stringHandle
+        );
+#else
+    HSTRING_REFERENCE* string = (HSTRING_REFERENCE*)String;
+
+    string->Flags = HSTRING_REFERENCE_FLAG;
+    string->Length = (UINT32)PhCountStringZ(SourceString);
+    string->Buffer = SourceString;
+
+    return S_OK;
+#endif
+}
+
+// rev from WindowsCreateStringReference (dmex)
+/**
+ * \brief Creates a new string reference based on the specified string.
+ *
+ * \param SourceString A null-terminated string to use as the source for the new string.
+ * \param Length The count of characters for the string.
+ * \param String A pointer to the newly created string.
+ * \return Successful or errant status.
+ */
+HRESULT PhCreateWindowsRuntimeStringReferenceEx(
+    _In_ PCWSTR SourceString,
+    _In_ UINT32 Length,
+    _Out_ PVOID String
+    )
+{
+#if defined(PH_NATIVE_WINDOWS_RUNTIME_STRING)
+    HSTRING stringHandle;
+
+    return WindowsCreateStringReference(
+        SourceString,
+        Length,
+        String,
+        &stringHandle
+        );
+#else
+    HSTRING_REFERENCE* string = (HSTRING_REFERENCE*)String;
+
+    string->Flags = HSTRING_REFERENCE_FLAG;
+    string->Length = Length;
+    string->Buffer = SourceString;
+
+    return S_OK;
+#endif
+}
+
+// rev from WindowsCreateString (dmex)
+/**
+ * \brief Creates a new string based on the specified string.
+ *
+ * \param SourceString A null-terminated string to use as the source for the new string.
+ * \param String A pointer to the newly created string.
+ * \return Successful or errant status.
+ */
+HRESULT PhCreateWindowsRuntimeString(
+    _In_ PCWSTR SourceString,
+    _Out_ HSTRING* String
+    )
+{
+#if defined(PH_NATIVE_WINDOWS_RUNTIME_STRING)
+    return WindowsCreateString(
+        SourceString,
+        (UINT32)PhCountStringZ(SourceString),
+        String
+        );
+#else
+    SIZE_T stringLength;
+    SIZE_T bufferLength;
+    HSTRING_INSTANCE* string;
+
+    stringLength = PhCountStringZ(SourceString) * sizeof(WCHAR);
+    bufferLength = sizeof(HSTRING_INSTANCE) + stringLength + sizeof(UNICODE_NULL);
+
+    if (bufferLength > UINT_MAX)
+        return MEM_E_INVALID_SIZE;
+
+    string = RtlAllocateHeap(RtlProcessHeap(), 0, bufferLength);
+
+    if (!string)
+        return E_OUTOFMEMORY;
+
+    assert(!(stringLength & 1));
+
+    string->Flags = 0;
+    string->ReferenceCount = 1;
+    string->Buffer = string->Data;
+    string->Length = (UINT32)stringLength / sizeof(WCHAR);
+    memcpy(string->Data, SourceString, stringLength);
+    string->Data[string->Length] = UNICODE_NULL;
+
+    *String = (HSTRING)string;
+    return S_OK;
+#endif
+}
+
+// rev from WindowsDeleteString (dmex)
+/**
+ * Decrements the reference count of a string.
+ *
+ * \param String The string to be deleted.
+ */
+VOID PhDeleteWindowsRuntimeString(
+    _In_opt_ HSTRING String
+    )
+{
+#if defined(PH_NATIVE_WINDOWS_RUNTIME_STRING)
+    WindowsDeleteString(String);
+#else
+    HSTRING_INSTANCE* string = (HSTRING_INSTANCE*)String;
+    LONG newRefCount;
+
+    if (!string || BooleanFlagOn(string->Flags, HSTRING_REFERENCE_FLAG))
+        return;
+
+    newRefCount = InterlockedDecrement(&string->ReferenceCount);
+    ASSUME_ASSERT(newRefCount >= 0);
+
+    if (newRefCount == 0)
+    {
+        RtlFreeHeap(RtlProcessHeap(), 0, string);
+    }
+#endif
+}
+
+// rev from WindowsGetStringLen (dmex)
+/**
+ * \brief Gets the length, in Unicode characters, of the specified string.
+ *
+ * \param String The string to be counted.
+ * \return Successful or errant status.
+ */
+ULONG PhGetWindowsRuntimeStringLength(
+    _In_opt_ HSTRING String
+    )
+{
+#if defined(PH_NATIVE_WINDOWS_RUNTIME_STRING)
+    return WindowsGetStringLen(String);
+#else
+    HSTRING_INSTANCE* string = (HSTRING_INSTANCE*)String;
+
+    if (string)
+    {
+        return string->Length;
+    }
+
+    return 0;
+#endif
+}
+
+// rev from WindowsGetStringRawBuffer (dmex)
+/**
+ * \brief Retrieves the backing buffer for the specified string.
+ *
+ * \param String An optional string for which the backing buffer is to be retrieved. Can be NULL.
+ * \param Length The number of Unicode characters in the backing buffer for String (including embedded null characters, but excluding the terminating null).
+ * \return A pointer to the buffer that provides the backing store for string, or the empty string if string is NULL or the empty string.
+ */
+PCWSTR PhGetWindowsRuntimeStringBuffer(
+    _In_opt_ HSTRING String,
+    _Out_opt_ PULONG Length
+    )
+{
+#if defined(PH_NATIVE_WINDOWS_RUNTIME_STRING)
+    return WindowsGetStringRawBuffer(String, Length);
+#else
+    HSTRING_INSTANCE* string = (HSTRING_INSTANCE*)String;
+
+    if (string)
+    {
+        if (Length)
+            *Length = string->Length;
+
+        return string->Buffer;
+    }
+    else
+    {
+        if (Length)
+            *Length = 0;
+
+        return L"";
+    }
+#endif
+}
+
+#pragma region Cryptographic Buffer
+
+#include <windows.security.cryptography.h>
+
+// 320b7e22-3cb0-4cdf-8663-1d28910065eb
+DEFINE_GUID(IID_ICryptographicBufferStatics, 0x320b7e22, 0x3cb0, 0x4cdf, 0x86, 0x63, 0x1d, 0x28, 0x91, 0x00, 0x65, 0xeb);
+
+PPH_STRING PhCryptographicBufferToHexString(
+    _In_ __x_ABI_CWindows_CStorage_CStreams_CIBuffer* Buffer
+    )
+{
+    PPH_STRING string = NULL;
+    __x_ABI_CWindows_CSecurity_CCryptography_CICryptographicBufferStatics* cryptographicBufferStatics;
+    HSTRING cryptographicBufferHandle;
+
+    if (SUCCEEDED(PhGetActivationFactory(
+        L"CryptoWinRT.dll",
+        RuntimeClass_Windows_Security_Cryptography_CryptographicBuffer,
+        &IID_ICryptographicBufferStatics,
+        &cryptographicBufferStatics
+        )))
+    {
+        if (SUCCEEDED(__x_ABI_CWindows_CSecurity_CCryptography_CICryptographicBufferStatics_EncodeToHexString(
+            cryptographicBufferStatics,
+            Buffer,
+            &cryptographicBufferHandle
+            )))
+        {
+            string = PhCreateStringFromWindowsRuntimeString(cryptographicBufferHandle);
+            PhDeleteWindowsRuntimeString(cryptographicBufferHandle);
+        }
+
+        __x_ABI_CWindows_CSecurity_CCryptography_CICryptographicBufferStatics_Release(cryptographicBufferStatics);
+    }
+
+    return string;
+}
+
+#pragma endregion
+
+#pragma region Data Reader
+
+// 11fcbfc8-f93a-471b-b121-f379e349313c
+DEFINE_GUID(IID_IDataReaderStatics, 0x11fcbfc8, 0xf93a, 0x471b, 0xb1, 0x21, 0xf3, 0x79, 0xe3, 0x49, 0x31, 0x3c);
+
+PPH_STRING PhDataReaderBufferToHexString(
+    _In_ __x_ABI_CWindows_CStorage_CStreams_CIBuffer* Buffer
+    )
+{
+    PPH_STRING string = NULL;
+    __x_ABI_CWindows_CStorage_CStreams_CIDataReaderStatics* dataReaderStatics;
+    __x_ABI_CWindows_CStorage_CStreams_CIDataReader* dataReader;
+    ULONG dataBufferLength = 0;
+    UCHAR dataBuffer[128] = { 0 };
+
+    if (SUCCEEDED(__x_ABI_CWindows_CStorage_CStreams_CIBuffer_get_Length(Buffer, &dataBufferLength)) && dataBufferLength < sizeof(dataBuffer))
+    {
+        if (SUCCEEDED(PhGetActivationFactory(
+            L"WinTypes.dll",
+            RuntimeClass_Windows_Storage_Streams_DataReader,
+            &IID_IDataReaderStatics,
+            &dataReaderStatics
+            )))
+        {
+            if (SUCCEEDED(__x_ABI_CWindows_CStorage_CStreams_CIDataReaderStatics_FromBuffer(dataReaderStatics, Buffer, &dataReader)))
+            {
+                if (SUCCEEDED(__x_ABI_CWindows_CStorage_CStreams_CIDataReader_ReadBytes(dataReader, dataBufferLength, dataBuffer)))
+                {
+                    string = PhBufferToHexString(dataBuffer, dataBufferLength);
+                }
+
+                __x_ABI_CWindows_CStorage_CStreams_CIDataReader_Release(dataReader);
+            }
+
+            __x_ABI_CWindows_CStorage_CStreams_CIDataReaderStatics_Release(dataReaderStatics);
+        }
+    }
+
+    return string;
+}
+
+#pragma endregion
+
+#pragma region System Identification
+
+#include <windows.system.profile.h>
+
+// 5581f42a-d3df-4d93-a37d-c41a616c6d01
+DEFINE_GUID(IID_ISystemIdentificationStatics, 0x5581f42a, 0xd3df, 0x4d93, 0xa3, 0x7d, 0xc4, 0x1a, 0x61, 0x6c, 0x6d, 0x01);
+
+PPH_STRING PhSystemIdentificationToString(
+    _In_ __x_ABI_CWindows_CSystem_CProfile_CISystemIdentificationInfo* IdentificationInfo
+    )
+{
+    __x_ABI_CWindows_CSystem_CProfile_CSystemIdentificationSource source;
+    __x_ABI_CWindows_CStorage_CStreams_CIBuffer* buffer;
+    PPH_STRING identifier = NULL;
+    PCWSTR string = L"Unknown";
+
+    if (SUCCEEDED(__x_ABI_CWindows_CSystem_CProfile_CISystemIdentificationInfo_get_Id(IdentificationInfo, &buffer)))
+    {
+        identifier = PhCryptographicBufferToHexString(buffer);
+
+        if (PhIsNullOrEmptyString(identifier))
+        {
+            identifier = PhDataReaderBufferToHexString(buffer);
+        }
+
+        __x_ABI_CWindows_CStorage_CStreams_CIBuffer_Release(buffer);
+    }
+
+    if (SUCCEEDED(__x_ABI_CWindows_CSystem_CProfile_CISystemIdentificationInfo_get_Source(IdentificationInfo, &source)))
+    {
+        switch (source)
+        {
+        case SystemIdentificationSource_Tpm:
+            string = L"TPM";
+            break;
+        case SystemIdentificationSource_Uefi:
+            string = L"UEFI";
+            break;
+        case SystemIdentificationSource_Registry:
+            string = L"Registry";
+            break;
+        }
+    }
+
+    PhMoveReference(&identifier, PhFormatString(
+        L"%s (%s)",
+        PhGetStringOrDefault(identifier, L"Unknown"),
+        string
+        ));
+
+    return identifier;
+}
+
+typedef struct _PH_APPHWID_QUERY_CONTEXT
+{
+    HANDLE ProcessId;
+    HANDLE ThreadId;
+    HANDLE ProcessHandle;
+    HANDLE ThreadHandle;
+} PH_APPHWID_QUERY_CONTEXT, *PPH_APPHWID_QUERY_CONTEXT;
+
+static PVOID PhDetoursPackageSystemIdentificationContext(
+    _In_opt_ PPH_APPHWID_QUERY_CONTEXT Buffer,
+    _In_ BOOLEAN Initialize
+    )
+{
+    static PH_INITONCE initOnce = PH_INITONCE_INIT;
+    static ULONG index = TLS_OUT_OF_INDEXES;
+
+    if (PhBeginInitOnce(&initOnce))
+    {
+        index = PhTlsAlloc();
+        PhEndInitOnce(&initOnce);
+    }
+
+    if (index != TLS_OUT_OF_INDEXES)
+    {
+        if (Initialize)
+        {
+            if (NT_SUCCESS(PhTlsSetValue(index, Buffer)))
+                return Buffer;
+        }
+        else
+        {
+            return PhTlsGetValue(index);
+        }
+    }
+
+    return NULL;
+}
+
+static HANDLE WINAPI PhDetoursPackageSystemIdentificationCurrentProcess(
+    VOID
+    )
+{
+    PPH_APPHWID_QUERY_CONTEXT context = PhDetoursPackageSystemIdentificationContext(NULL, FALSE);
+
+    if (context)
+        return context->ProcessHandle;
+    else
+        return NtCurrentProcess();
+}
+
+static HANDLE WINAPI PhDetoursPackageSystemIdentificationCurrentThread(
+    VOID
+    )
+{
+    PPH_APPHWID_QUERY_CONTEXT context = PhDetoursPackageSystemIdentificationContext(NULL, FALSE);
+
+    if (context)
+        return context->ThreadHandle;
+    else
+        return NtCurrentThread();
+}
+
+static ULONG WINAPI PhDetoursPackageSystemIdentificationCurrentProcessId(
+    VOID
+    )
+{
+    PPH_APPHWID_QUERY_CONTEXT context = PhDetoursPackageSystemIdentificationContext(NULL, FALSE);
+
+    if (context)
+        return HandleToUlong(context->ProcessId);
+    else
+        return HandleToUlong(NtCurrentProcessId());
+}
+
+static ULONG WINAPI PhDetoursPackageSystemIdentificationCurrentThreadId(
+    VOID
+    )
+{
+    PPH_APPHWID_QUERY_CONTEXT context = PhDetoursPackageSystemIdentificationContext(NULL, FALSE);
+
+    if (context)
+        return HandleToUlong(context->ThreadId);
+    else
+        return HandleToUlong(NtCurrentThreadId());
+}
+
+static BOOL WINAPI PhDetoursPackageSystemIdentificationCloseHandle(
+    _In_ _Post_ptr_invalid_ HANDLE hObject
+    )
+{
+    return TRUE;
+}
+
+static HRESULT PhDetoursPackageSystemIdentificationInitialize(
+    _In_ PVOID Address,
+    _In_ PPH_APPHWID_QUERY_CONTEXT Context
+    )
+{
+    PVOID baseAddress = PhGetLoaderEntryPcToFileHeader(Address);
+
+    if (!baseAddress)
+        return E_FAIL;
+
+    if (!NT_SUCCESS(PhLoaderEntryDetourImportProcedure(
+        baseAddress,
+        "api-ms-win-core-processthreads-l1-1-0.dll",
+        "GetCurrentProcess",
+        PhDetoursPackageSystemIdentificationCurrentProcess,
+        NULL
+        )))
+    {
+        return E_FAIL;
+    }
+
+    if (!NT_SUCCESS(PhLoaderEntryDetourImportProcedure(
+        baseAddress,
+        "api-ms-win-core-processthreads-l1-1-0.dll",
+        "GetCurrentProcessId",
+        PhDetoursPackageSystemIdentificationCurrentProcessId,
+        NULL
+        )))
+    {
+        return E_FAIL;
+    }
+
+    if (!NT_SUCCESS(PhLoaderEntryDetourImportProcedure(
+        baseAddress,
+        "api-ms-win-core-processthreads-l1-1-0.dll",
+        "GetCurrentThread",
+        PhDetoursPackageSystemIdentificationCurrentThread,
+        NULL
+        )))
+    {
+        return E_FAIL;
+    }
+
+    if (!NT_SUCCESS(PhLoaderEntryDetourImportProcedure(
+        baseAddress,
+        "api-ms-win-core-processthreads-l1-1-0.dll",
+        "GetCurrentThreadId",
+        PhDetoursPackageSystemIdentificationCurrentThreadId,
+        NULL
+        )))
+    {
+        return E_FAIL;
+    }
+
+    if (!NT_SUCCESS(PhLoaderEntryDetourImportProcedure(
+        baseAddress,
+        "api-ms-win-core-handle-l1-1-0.dll",
+        "CloseHandle",
+        PhDetoursPackageSystemIdentificationCloseHandle,
+        NULL
+        )))
+    {
+        return E_FAIL;
+    }
+
+    if (!PhDetoursPackageSystemIdentificationContext(Context, TRUE))
+    {
+        return E_FAIL;
+    }
+
+    return S_OK;
+}
+
+static HRESULT PhDetoursPackageSystemIdentificationDelete(
+    VOID
+    )
+{
+    if (!PhDetoursPackageSystemIdentificationContext(NULL, TRUE))
+    {
+        return E_FAIL;
+    }
+
+    return S_OK;
+}
+
+static HRESULT PhQueryProcessSystemIdentification(
+    _In_ PPH_APPHWID_QUERY_CONTEXT Context,
+    _Out_ PPH_STRING* SystemIdForPublisher,
+    _Out_ PPH_STRING* SystemIdForUser
+    )
+{
+    HRESULT status;
+    __x_ABI_CWindows_CSystem_CProfile_CISystemIdentificationStatics* systemIdStatics = NULL;
+    __x_ABI_CWindows_CSystem_CProfile_CISystemIdentificationInfo* systemIdPublisher;
+    __x_ABI_CWindows_CSystem_CProfile_CISystemIdentificationInfo* systemIdUser;
+    BOOLEAN revertImpersonationToken = FALSE;
+    HANDLE tokenHandle = NULL;
+    HRESULT systemIdForUserStatus = E_FAIL;
+    HRESULT systemIdPublisherStatus = E_FAIL;
+    PPH_STRING systemIdForPublisherString = NULL;
+    PPH_STRING systemIdForUserString = NULL;
+
+    status = PhGetActivationFactory(
+        L"Windows.System.Profile.SystemId.dll",
+        RuntimeClass_Windows_System_Profile_SystemIdentification,
+        &IID_ISystemIdentificationStatics,
+        &systemIdStatics
+        );
+
+    if (FAILED(status))
+        return status;
+
+    if (NT_SUCCESS(PhOpenProcessToken(
+        Context->ProcessHandle,
+        TOKEN_QUERY | TOKEN_IMPERSONATE | TOKEN_DUPLICATE,
+        &tokenHandle
+        )))
+    {
+        revertImpersonationToken = NT_SUCCESS(PhImpersonateToken(NtCurrentThread(), tokenHandle));
+    }
+
+    // We've impersonated the package but the SystemIdentification class
+    // gets confused and the package manager queries the impersonated token
+    // and the WinRT class queries our token... Redirect the handle imports
+    // so we can query the correct token. If we can't then unfortunately
+    // developers can't verify their SystemID support returns correct values
+    // or verify their capabilities/sandboxing/token permissions are setup correctly (dmex)
+
+    status = PhDetoursPackageSystemIdentificationInitialize(
+        (PVOID)systemIdStatics->lpVtbl,
+        Context
+        );
+
+    if (FAILED(status))
+        goto CleanupExit;
+
+    if ((systemIdPublisherStatus = __x_ABI_CWindows_CSystem_CProfile_CISystemIdentificationStatics_GetSystemIdForPublisher(
+        systemIdStatics,
+        &systemIdPublisher
+        )) == S_OK)
+    {
+        systemIdForPublisherString = PhSystemIdentificationToString(systemIdPublisher);
+        __x_ABI_CWindows_CSystem_CProfile_CISystemIdentificationInfo_Release(systemIdPublisher);
+    }
+
+    if ((systemIdForUserStatus = __x_ABI_CWindows_CSystem_CProfile_CISystemIdentificationStatics_GetSystemIdForUser(
+        systemIdStatics,
+        NULL,
+        &systemIdUser
+        )) == S_OK)
+    {
+        systemIdForUserString = PhSystemIdentificationToString(systemIdUser);
+        __x_ABI_CWindows_CSystem_CProfile_CISystemIdentificationInfo_Release(systemIdUser);
+    }
+
+CleanupExit:
+    if (systemIdStatics)
+    {
+        __x_ABI_CWindows_CSystem_CProfile_CISystemIdentificationStatics_Release(systemIdStatics);
+        systemIdStatics = NULL;
+    }
+
+    if (tokenHandle)
+    {
+        if (revertImpersonationToken)
+            PhRevertImpersonationToken(NtCurrentThread());
+
+        NtClose(tokenHandle);
+        tokenHandle = NULL;
+    }
+
+    PhDetoursPackageSystemIdentificationDelete();
+
+    *SystemIdForPublisher = NULL;
+    *SystemIdForUser = NULL;
+
+    // Note: Load messages after reverting impersonation otherwise the kernel32.dll message table doesn't get mapped.
+    // Errors will be from the process token missing the "userSystemId" capability or limited process token privileges. (dmex)
+
+    if (HR_SUCCESS(systemIdPublisherStatus))
+    {
+        *SystemIdForPublisher = systemIdForPublisherString;
+    }
+    else
+    {
+        //if (HRESULT_FACILITY(systemIdPublisherStatus) == FACILITY_NT_BIT >> NT_FACILITY_SHIFT)
+        //{
+        //    ClearFlag(systemIdPublisherStatus, FACILITY_NT_BIT); // 0xD0000022 -> 0xC0000022
+        //}
+
+        if (HRESULT_NTSTATUS(systemIdPublisherStatus))
+        {
+            *SystemIdForPublisher = PhGetStatusMessage(PhNtStatusFromHResult(systemIdPublisherStatus), 0);
+        }
+
+        if (PhIsNullOrEmptyString(*SystemIdForPublisher))
+        {
+            *SystemIdForPublisher = PhGetStatusMessage(0, HRESULT_CODE(systemIdPublisherStatus));
+        }
+    }
+
+    if (HR_SUCCESS(systemIdForUserStatus))
+    {
+        *SystemIdForUser = systemIdForUserString;
+    }
+    else
+    {
+        //if (HRESULT_FACILITY(systemIdForUserStatus) == FACILITY_NT_BIT >> NT_FACILITY_SHIFT)
+        //{
+        //    ClearFlag(systemIdForUserStatus, FACILITY_NT_BIT); // 0xD0000022 -> 0xC0000022
+        //}
+
+        if (HRESULT_NTSTATUS(systemIdForUserStatus))
+        {
+            *SystemIdForUser = PhGetStatusMessage(PhNtStatusFromHResult(systemIdForUserStatus), 0);
+        }
+
+        if (PhIsNullOrEmptyString(*SystemIdForUser))
+        {
+            *SystemIdForUser = PhGetStatusMessage(0, HRESULT_CODE(systemIdForUserStatus));
+        }
+    }
+
+    return status;
+}
+
+_Function_class_(PH_ENUM_NEXT_THREAD)
+static NTSTATUS NTAPI PhEnumNextThreadSystemIdentification(
+    _In_ HANDLE ThreadHandle,
+    _Inout_ HANDLE* Context
+    )
+{
+    *Context = ThreadHandle;
+    return STATUS_NO_MORE_ENTRIES;
+}
+
+HRESULT PhGetProcessSystemIdentification(
+    _In_ HANDLE ProcessId,
+    _Out_ PPH_STRING* SystemIdForPublisher,
+    _Out_ PPH_STRING* SystemIdForUser
+    )
+{
+    HRESULT status;
+    HANDLE processHandle;
+    HANDLE threadHandle = NULL;
+    HANDLE threadId = NULL;
+    PVOID processes;
+
+    status = PhOpenProcess(
+        &processHandle,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+        ProcessId
+        );
+
+    if (!NT_SUCCESS(status))
+    {
+        *SystemIdForPublisher = NULL;
+        *SystemIdForUser = NULL;
+
+        return HRESULT_FROM_NT(status);
+    }
+
+    status = PhEnumNextThread(
+        processHandle,
+        NULL,
+        THREAD_QUERY_LIMITED_INFORMATION,
+        PhEnumNextThreadSystemIdentification,
+        &threadHandle
+        );
+
+    if (!NT_SUCCESS(status))
+    {
+        if (NT_SUCCESS(PhEnumProcesses(&processes)))
+        {
+            PSYSTEM_PROCESS_INFORMATION process;
+
+            if (process = PhFindProcessInformation(processes, ProcessId))
+            {
+                for (ULONG i = 0; i < process->NumberOfThreads; i++)
+                {
+                    HANDLE tempThreadHandle;
+
+                    threadId = process->Threads[i].ClientId.UniqueThread;
+
+                    if (NT_SUCCESS(PhOpenThread(
+                        &tempThreadHandle,
+                        THREAD_QUERY_LIMITED_INFORMATION,
+                        threadId
+                        )))
+                    {
+                        threadHandle = tempThreadHandle;
+                        break;
+                    }
+                }
+            }
+
+            PhFree(processes);
+        }
+    }
+
+    if (!threadHandle)
+    {
+        status = HRESULT_FROM_NT(STATUS_UNSUCCESSFUL);
+        goto CleanupExit;
+    }
+
+    {
+        PH_APPHWID_QUERY_CONTEXT queryContext;
+
+        memset(&queryContext, 0, sizeof(PH_APPHWID_QUERY_CONTEXT));
+        queryContext.ProcessId = ProcessId;
+        queryContext.ProcessHandle = processHandle;
+        queryContext.ThreadId = threadId;
+        queryContext.ThreadHandle = threadHandle;
+
+        status = PhQueryProcessSystemIdentification(&queryContext, SystemIdForPublisher, SystemIdForUser);
+    }
+
+CleanupExit:
+    if (threadHandle)
+    {
+        NtClose(threadHandle);
+    }
+
+    if (processHandle)
+    {
+        NtClose(processHandle);
+    }
+
+    return status;
+}
+
+#pragma endregion
+
+#pragma region Display Information
+
+// BED112AE-ADC3-4DC9-AE65-851F4D7D4799
+DEFINE_GUID(IID_IDisplayInformation, 0xBED112AE, 0xADC3, 0x4DC9, 0xAE, 0x65, 0x85, 0x1F, 0x4D, 0x7D, 0x47, 0x99);
+// C6A02A6C-D452-44DC-BA07-96F3C6ADF9D1
+DEFINE_GUID(IID_IDisplayInformationStatics, 0xc6a02a6c, 0xd452, 0x44dc, 0xba, 0x07, 0x96, 0xf3, 0xc6, 0xad, 0xf9, 0xd1);
+// 6937ED8D-30EA-4DED-8271-4553FF02F68A
+DEFINE_GUID(IID_IDisplayPropertiesStatics, 0x6937ed8d, 0x30ea, 0x4ded, 0x82, 0x71, 0x45, 0x53, 0xff, 0x02, 0xf6, 0x8a);
+
+FLOAT PhGetDisplayLogicalDpi(
+    VOID
+    )
+{
+    FLOAT displayLogicalDpi = 0;
+    __x_ABI_CWindows_CGraphics_CDisplay_CIDisplayPropertiesStatics* displayProperties;
+    HRESULT status;
+
+    status = PhGetActivationFactory(
+        L"Windows.Graphics.dll",
+        RuntimeClass_Windows_Graphics_Display_DisplayProperties,
+        &IID_IDisplayPropertiesStatics,
+        &displayProperties
+        );
+
+    if (SUCCEEDED(status))
+    {
+        FLOAT value;
+
+        status = __x_ABI_CWindows_CGraphics_CDisplay_CIDisplayPropertiesStatics_get_LogicalDpi(displayProperties, &value);
+
+        if (SUCCEEDED(status))
+        {
+            displayLogicalDpi = value;
+        }
+    }
+
+    // Requires IWindowsXamlManagerStatics_InitializeForCurrentThread (dmex)
+    //
+    //__x_ABI_CWindows_CGraphics_CDisplay_CIDisplayInformationStatics* displayInformation;
+    //status = PhGetActivationFactory(
+    //    L"Windows.Graphics.dll",
+    //    RuntimeClass_Windows_Graphics_Display_DisplayInformation,
+    //    &IID_IDisplayInformationStatics,
+    //    &displayInformation
+    //    );
+    //
+    //if (SUCCEEDED(status))
+    //{
+    //    __x_ABI_CWindows_CGraphics_CDisplay_CIDisplayInformation* display_information;
+    //    __x_ABI_CWindows_CGraphics_CDisplay_CResolutionScale resolution_scale;
+    //
+    //    if (SUCCEEDED(__x_ABI_CWindows_CGraphics_CDisplay_CIDisplayInformationStatics_GetForCurrentView(displayInformation, &display_information)))
+    //    {
+    //        if (SUCCEEDED(__x_ABI_CWindows_CGraphics_CDisplay_CIDisplayInformation_get_ResolutionScale(display_information, &resolution_scale)))
+    //        {
+    //            float scale = (float)(resolution_scale / 100.0f);
+    //        }
+    //    }
+    //}
+
+    return displayLogicalDpi;
+}
+
+#pragma endregion
+
+#pragma region Package Manager
+
+#include <appmodel.h>
+#include <Windows.Management.Deployment.h>
+
+// 9a7d4b65-5e8f-4fc7-a2e5-7f6925cb8b53
+DEFINE_GUID(IID_IPackageManager, 0x9A7D4B65, 0x5E8F, 0x4FC7, 0xA2, 0xE5, 0x7F, 0x69, 0x25, 0xCB, 0x8B, 0x53);
+// a6612fb6-7688-4ace-95fb-359538e7aa01
+DEFINE_GUID(IID_IPackage2, 0xA6612FB6, 0x7688, 0x4ACE, 0x95, 0xFB, 0x35, 0x95, 0x38, 0xE7, 0xAA, 0x01);
+// 2c584f7b-ce2a-4be6-a093-77cfbb2a7ea1
+DEFINE_GUID(IID_IPackage8, 0x2c584f7b, 0xce2a, 0x4be6, 0xa0, 0x93, 0x77, 0xcf, 0xbb, 0x2a, 0x7e, 0xa1);
+// d0a618ad-bf35-42ac-ac06-86eeeb41d04b
+DEFINE_GUID(IID_IAppListEntry2, 0xd0a618ad, 0xbf35, 0x42ac, 0xac, 0x06, 0x86, 0xee, 0xeb, 0x41, 0xd0, 0x4b);
+// cf7f59b3-6a09-4de8-a6c0-5792d56880d1
+DEFINE_GUID(IID_IAppInfo, 0xcf7f59b3, 0x6a09, 0x4de8, 0xa6, 0xc0, 0x57, 0x92, 0xd5, 0x68, 0x80, 0xd1);
+// 4207a996-ca2f-42f7-bde8-8b10457a7f30
+DEFINE_GUID(IID_IStorageItem, 0x4207a996, 0xca2f, 0x42f7, 0xbd, 0xe8, 0x8b, 0x10, 0x45, 0x7a, 0x7f, 0x30);
+
+static typeof(&OpenPackageInfoByFullNameForUser) OpenPackageInfoByFullNameForUser_I = NULL;
+static typeof(&GetPackageApplicationIds) GetPackageApplicationIds_I = NULL;
+static typeof(&ClosePackageInfo) ClosePackageInfo_I = NULL;
+
+static BOOLEAN PhPackageImportsInitialized(
+    VOID
+    )
+{
+    static PH_INITONCE initOnce = PH_INITONCE_INIT;
+    static BOOLEAN initialized = FALSE;
+
+    if (PhBeginInitOnce(&initOnce))
+    {
+        PVOID baseAddress;
+
+        if (baseAddress = PhGetLoaderEntryDllBaseZ(L"kernelbase.dll"))
+        {
+            OpenPackageInfoByFullNameForUser_I = PhGetDllBaseProcedureAddress(baseAddress, "OpenPackageInfoByFullNameForUser", 0);
+            GetPackageApplicationIds_I = PhGetDllBaseProcedureAddress(baseAddress, "GetPackageApplicationIds", 0);
+            ClosePackageInfo_I = PhGetDllBaseProcedureAddress(baseAddress, "ClosePackageInfo", 0);
+        }
+
+        if (
+            OpenPackageInfoByFullNameForUser_I &&
+            GetPackageApplicationIds_I &&
+            ClosePackageInfo_I
+            )
+        {
+            initialized = TRUE;
+        }
+
+        PhEndInitOnce(&initOnce);
+    }
+
+    return initialized;
+}
+
+_Success_(return)
+BOOLEAN PhGetPackageApplicationIds(
+    _In_ PCWSTR PackageFullName,
+    _Out_ PWSTR** ApplicationUserModelIds,
+    _Out_ PULONG ApplicationUserModelIdsCount
+    )
+{
+    BOOLEAN success = FALSE;
+    ULONG status;
+    PACKAGE_INFO_REFERENCE packageHandle;
+    ULONG bufferCount = 0;
+    ULONG bufferLength = 0;
+    PBYTE buffer = NULL;
+
+    if (!PhPackageImportsInitialized())
+        return FALSE;
+
+    status = OpenPackageInfoByFullNameForUser_I(
+        NULL,
+        PackageFullName,
+        0,
+        &packageHandle
+        );
+
+    if (status != ERROR_SUCCESS)
+        return FALSE;
+
+    status = GetPackageApplicationIds_I(
+        packageHandle,
+        &bufferLength,
+        NULL,
+        NULL
+        );
+
+    if (status != ERROR_INSUFFICIENT_BUFFER)
+        goto CleanupExit;
+
+    buffer = PhAllocate(bufferLength);
+    memset(buffer, 0, bufferLength);
+
+    status = GetPackageApplicationIds_I(
+        packageHandle,
+        &bufferLength,
+        buffer,
+        &bufferCount
+        );
+
+    if (status != ERROR_SUCCESS)
+        goto CleanupExit;
+
+    success = TRUE;
+
+CleanupExit:
+
+    ClosePackageInfo_I(packageHandle);
+
+    if (success)
+    {
+        *ApplicationUserModelIds = (PWSTR*)buffer;
+        *ApplicationUserModelIdsCount = bufferCount;
+    }
+    else
+    {
+        if (buffer)
+        {
+            PhFree(buffer);
+        }
+    }
+
+    return success;
+}
+
+typedef _Enum_is_bitflag_ enum _PH_QUERY_PACKAGE_INFO_TYPE
+{
+    PH_QUERY_PACKAGE_INFO_NAME = 1,
+    PH_QUERY_PACKAGE_INFO_FULLNAME = 2,
+    PH_QUERY_PACKAGE_INFO_FAMILYNAME = 4,
+    PH_QUERY_PACKAGE_INFO_DISPLAYNAME = 8,
+    PH_QUERY_PACKAGE_INFO_VERSION = 16,
+    PH_QUERY_PACKAGE_INFO_LOGO = 32,
+    PH_QUERY_PACKAGE_INFO_LOCATION = 64,
+} PH_QUERY_PACKAGE_INFO_TYPE;
+DEFINE_ENUM_FLAG_OPERATORS(PH_QUERY_PACKAGE_INFO_TYPE);
+
+BOOLEAN PhQueryApplicationModelPackageInformation(
+    _In_ PPH_LIST PackageList,
+    _In_ __x_ABI_CWindows_CApplicationModel_CIPackage* AppPackage,
+    _In_ __x_ABI_CWindows_CApplicationModel_CIPackage2* AppPackage2,
+    _In_ PH_QUERY_PACKAGE_INFO_TYPE FilterType
+    )
+{
+    __x_ABI_CWindows_CStorage_CIStorageFolder* appPackageFolder;
+    __x_ABI_CWindows_CStorage_CIStorageItem* appPackageFolderItem;
+    __x_ABI_CWindows_CApplicationModel_CIPackageId* appPackageID;
+    __x_ABI_CWindows_CFoundation_CIUriRuntimeClass* appPackageLogo;
+    PPH_STRING packageInstallLocationString = NULL;
+    PPH_STRING packageNameString = NULL;
+    PPH_STRING packageFullNameString = NULL;
+    PPH_STRING packageFamilyNameString = NULL;
+    PPH_STRING packageDisplayNameString = NULL;
+    PPH_STRING packageLogoString = NULL;
+    PPH_STRING packageVersionString = NULL;
+    HSTRING stringHandle = NULL;
+
+    if (SUCCEEDED(__x_ABI_CWindows_CApplicationModel_CIPackage_get_Id(AppPackage, &appPackageID)))
+    {
+        if (FlagOn(FilterType, PH_QUERY_PACKAGE_INFO_NAME))
+        {
+            if (SUCCEEDED(__x_ABI_CWindows_CApplicationModel_CIPackageId_get_Name(appPackageID, &stringHandle)))
+            {
+                if (PhGetWindowsRuntimeStringLength(stringHandle))
+                {
+                    packageNameString = PhCreateStringFromWindowsRuntimeString(stringHandle);
+                }
+
+                PhDeleteWindowsRuntimeString(stringHandle);
+            }
+        }
+
+        if (FlagOn(FilterType, PH_QUERY_PACKAGE_INFO_FULLNAME))
+        {
+            if (SUCCEEDED(__x_ABI_CWindows_CApplicationModel_CIPackageId_get_FullName(appPackageID, &stringHandle)))
+            {
+                if (PhGetWindowsRuntimeStringLength(stringHandle))
+                {
+                    packageFullNameString = PhCreateStringFromWindowsRuntimeString(stringHandle);
+                }
+
+                PhDeleteWindowsRuntimeString(stringHandle);
+            }
+        }
+
+        if (FlagOn(FilterType, PH_QUERY_PACKAGE_INFO_FAMILYNAME))
+        {
+            if (SUCCEEDED(__x_ABI_CWindows_CApplicationModel_CIPackageId_get_FamilyName(appPackageID, &stringHandle)))
+            {
+                if (PhGetWindowsRuntimeStringLength(stringHandle))
+                {
+                    packageFamilyNameString = PhCreateStringFromWindowsRuntimeString(stringHandle);
+                }
+
+                PhDeleteWindowsRuntimeString(stringHandle);
+            }
+        }
+
+        if (FlagOn(FilterType, PH_QUERY_PACKAGE_INFO_VERSION))
+        {
+            __x_ABI_CWindows_CApplicationModel_CPackageVersion appPackageVersion = { 0 };
+
+            if (SUCCEEDED(__x_ABI_CWindows_CApplicationModel_CIPackageId_get_Version(appPackageID, &appPackageVersion)))
+            {
+                PH_FORMAT format[7];
+
+                PhInitFormatU(&format[0], appPackageVersion.Major);
+                PhInitFormatC(&format[1], L'.');
+                PhInitFormatU(&format[2], appPackageVersion.Minor);
+                PhInitFormatC(&format[3], L'.');
+                PhInitFormatU(&format[4], appPackageVersion.Revision);
+                PhInitFormatC(&format[5], L'.');
+                PhInitFormatU(&format[6], appPackageVersion.Build);
+
+                packageVersionString = PhFormat(format, RTL_NUMBER_OF(format), 0);
+            }
+        }
+
+        __x_ABI_CWindows_CApplicationModel_CIPackageId_Release(appPackageID);
+    }
+
+    if (FlagOn(FilterType, PH_QUERY_PACKAGE_INFO_DISPLAYNAME))
+    {
+        if (SUCCEEDED(__x_ABI_CWindows_CApplicationModel_CIPackage2_get_DisplayName(AppPackage2, &stringHandle)))
+        {
+            if (PhGetWindowsRuntimeStringLength(stringHandle))
+            {
+                packageDisplayNameString = PhCreateStringFromWindowsRuntimeString(stringHandle);
+            }
+
+            PhDeleteWindowsRuntimeString(stringHandle);
+        }
+    }
+
+    if (FlagOn(FilterType, PH_QUERY_PACKAGE_INFO_LOGO))
+    {
+        if (SUCCEEDED(__x_ABI_CWindows_CApplicationModel_CIPackage2_get_Logo(AppPackage2, &appPackageLogo)))
+        {
+            if (SUCCEEDED(__x_ABI_CWindows_CFoundation_CIUriRuntimeClass_get_RawUri(appPackageLogo, &stringHandle)))
+            {
+                packageLogoString = PhCreateStringFromWindowsRuntimeString(stringHandle);
+                PhDeleteWindowsRuntimeString(stringHandle);
+            }
+
+            __x_ABI_CWindows_CFoundation_CIUriRuntimeClass_Release(appPackageLogo);
+        }
+    }
+
+    if (FlagOn(FilterType, PH_QUERY_PACKAGE_INFO_LOCATION))
+    {
+        if (SUCCEEDED(__x_ABI_CWindows_CApplicationModel_CIPackage_get_InstalledLocation(AppPackage, &appPackageFolder)))
+        {
+            if (SUCCEEDED(__x_ABI_CWindows_CStorage_CIStorageFolder_QueryInterface(appPackageFolder, &IID_IStorageItem, &appPackageFolderItem)))
+            {
+                if (SUCCEEDED(__x_ABI_CWindows_CStorage_CIStorageItem_get_Path(appPackageFolderItem, &stringHandle)))
+                {
+                    if (PhGetWindowsRuntimeStringLength(stringHandle))
+                    {
+                        packageInstallLocationString = PhCreateStringFromWindowsRuntimeString(stringHandle);
+                    }
+                    PhDeleteWindowsRuntimeString(stringHandle);
+                }
+
+                __x_ABI_CWindows_CStorage_CIStorageItem_Release(appPackageFolderItem);
+            }
+
+            __x_ABI_CWindows_CStorage_CIStorageFolder_Release(appPackageFolder);
+        }
+    }
+
+    if (packageFullNameString)
+    {
+        ULONG applicationUserModelIdsCount;
+        PWSTR* applicationUserModelIdsBuffer;
+
+        if (PhGetPackageApplicationIds(
+            PhGetString(packageFullNameString),
+            &applicationUserModelIdsBuffer,
+            &applicationUserModelIdsCount
+            ))
+        {
+            for (ULONG i = 0; i < applicationUserModelIdsCount; ++i)
+            {
+                PPH_APPUSERMODELID_ENUM_ENTRY entry;
+
+                entry = PhAllocateZero(sizeof(PH_APPUSERMODELID_ENUM_ENTRY));
+                entry->AppUserModelId = PhCreateString(applicationUserModelIdsBuffer[i]);
+                PhSetReference(&entry->PackageName, packageNameString);
+                PhSetReference(&entry->PackageDisplayName, packageDisplayNameString);
+                PhSetReference(&entry->PackageFamilyName, packageFamilyNameString);
+                PhSetReference(&entry->PackageInstallPath, packageInstallLocationString);
+                PhSetReference(&entry->PackageFullName, packageFullNameString);
+                PhSetReference(&entry->PackageVersion, packageVersionString);
+                PhSetReference(&entry->SmallLogoPath, packageLogoString);
+
+                PhAddItemList(PackageList, entry);
+            }
+        }
+    }
+
+    PhClearReference(&packageLogoString);
+    PhClearReference(&packageVersionString);
+    PhClearReference(&packageFullNameString);
+    PhClearReference(&packageInstallLocationString);
+    PhClearReference(&packageFamilyNameString);
+    PhClearReference(&packageDisplayNameString);
+    PhClearReference(&packageNameString);
+
+    return TRUE;
+}
+
+PPH_LIST PhEnumPackageApplicationUserModelIds(
+    VOID
+    )
+{
+    HRESULT status;
+    PPH_LIST list = NULL;
+    __x_ABI_CWindows_CManagement_CDeployment_CIPackageManager* packageManager = NULL;
+    __FIIterable_1_Windows__CApplicationModel__CPackage* enumPackages = NULL;
+    __FIIterator_1_Windows__CApplicationModel__CPackage* enumPackage = NULL;
+    __x_ABI_CWindows_CApplicationModel_CIPackage* currentPackage = NULL;
+    __x_ABI_CWindows_CApplicationModel_CIPackage2* currentPackage2 = NULL;
+    boolean haveCurrentPackage = FALSE;
+
+    status = PhActivateInstance(
+        L"AppXDeploymentClient.dll",
+        RuntimeClass_Windows_Management_Deployment_PackageManager,
+        &IID_IPackageManager,
+        &packageManager
+        );
+
+    if (HR_FAILED(status))
+        return NULL;
+
+    if (PhGetOwnTokenAttributes().Elevated)
+        status = __x_ABI_CWindows_CManagement_CDeployment_CIPackageManager_FindPackages(packageManager, &enumPackages);
+    else
+        status = __x_ABI_CWindows_CManagement_CDeployment_CIPackageManager_FindPackagesByUserSecurityId(packageManager, NULL, &enumPackages);
+
+    if (HR_FAILED(status))
+        goto CleanupExit;
+
+    status = __FIIterable_1_Windows__CApplicationModel__CPackage_First(enumPackages, &enumPackage);
+
+    if (HR_FAILED(status))
+        goto CleanupExit;
+
+    status = __FIIterator_1_Windows__CApplicationModel__CPackage_get_HasCurrent(enumPackage, &haveCurrentPackage);
+
+    if (HR_FAILED(status))
+        goto CleanupExit;
+
+    list = PhCreateList(10);
+
+    while (haveCurrentPackage)
+    {
+        status = __FIIterator_1_Windows__CApplicationModel__CPackage_get_Current(enumPackage, &currentPackage);
+
+        if (HR_SUCCESS(status))
+        {
+            status = __x_ABI_CWindows_CApplicationModel_CIPackage_QueryInterface(currentPackage, &IID_IPackage2, &currentPackage2);
+
+            if (HR_SUCCESS(status))
+            {
+                PhQueryApplicationModelPackageInformation(
+                    list,
+                    currentPackage,
+                    currentPackage2,
+                    PH_QUERY_PACKAGE_INFO_NAME | PH_QUERY_PACKAGE_INFO_FULLNAME | PH_QUERY_PACKAGE_INFO_FAMILYNAME |
+                    PH_QUERY_PACKAGE_INFO_DISPLAYNAME | PH_QUERY_PACKAGE_INFO_LOGO
+                    );
+
+                // Note: GetPackageApplicationIds returns all identifiers while the IAppListEntry2_get_AppUserModelId interface only returns a single entry (dmex)
+                //if (SUCCEEDED(__x_ABI_CWindows_CApplicationModel_CIPackage_QueryInterface(currentPackage, &IID_IPackage8, &currentPackage8)))
+                //if (SUCCEEDED(__x_ABI_CWindows_CApplicationModel_CIPackage8_GetAppListEntries(currentPackage8, &packageAppListEntryArray)))
+                //if (SUCCEEDED(__FIVectorView_1_Windows__CApplicationModel__CCore__CAppListEntry_get_Size(packageAppListEntryArray, &packageAppListEntryCount)))
+                //for (UINT32 i = 0; i < packageAppListEntryCount; i++)
+                //if (SUCCEEDED(__FIVectorView_1_Windows__CApplicationModel__CCore__CAppListEntry_GetAt(packageAppListEntryArray, i, &packageAppListEntry)))
+                //if (SUCCEEDED(__x_ABI_CWindows_CApplicationModel_CCore_CIAppListEntry_QueryInterface(packageAppListEntry, &IID_IAppListEntry2, &packageAppListEntry2)))
+                //if (SUCCEEDED(__x_ABI_CWindows_CApplicationModel_CCore_CIAppListEntry2_get_AppUserModelId(packageAppListEntry2, &packageAppUserModelIdString)))
+
+                __x_ABI_CWindows_CApplicationModel_CIPackage2_Release(currentPackage2);
+            }
+
+            __x_ABI_CWindows_CApplicationModel_CIPackage_Release(currentPackage);
+        }
+
+        if (HR_FAILED(status))
+            break;
+
+        status = __FIIterator_1_Windows__CApplicationModel__CPackage_MoveNext(enumPackage, &haveCurrentPackage);
+
+        if (HR_FAILED(status))
+            break;
+    }
+
+CleanupExit:
+    if (enumPackage)
+        __FIIterator_1_Windows__CApplicationModel__CPackage_Release(enumPackage);
+    if (enumPackages)
+        __FIIterable_1_Windows__CApplicationModel__CPackage_Release(enumPackages);
+    __x_ABI_CWindows_CManagement_CDeployment_CIPackageManager_Release(packageManager);
+
+    return list;
+}
+
+VOID PhDestroyEnumPackageApplicationUserModelIds(
+    _In_ PPH_LIST PackageList
+    )
+{
+    if (!PackageList)
+        return;
+
+    for (ULONG i = 0; i < PackageList->Count; i++)
+    {
+        PPH_APPUSERMODELID_ENUM_ENTRY entry = PackageList->Items[i];
+
+        PhClearReference(&entry->AppUserModelId);
+        PhClearReference(&entry->PackageName);
+        PhClearReference(&entry->PackageDisplayName);
+        PhClearReference(&entry->PackageFamilyName);
+        PhClearReference(&entry->PackageInstallPath);
+        PhClearReference(&entry->PackageFullName);
+        PhClearReference(&entry->PackageVersion);
+        PhClearReference(&entry->SmallLogoPath);
+
+        PhFree(entry);
+    }
+
+    PhDereferenceObject(PackageList);
+}
+
+#pragma endregion
+
+#pragma region IAsyncInfo
+
+#include <asyncinfo.h>
+
+typedef struct _PH_ASYNC_COMPLETED_HANDLER PH_ASYNC_COMPLETED_HANDLER, *PPH_ASYNC_COMPLETED_HANDLER;
+typedef struct _PH_IASYNC_OPERATION PH_IASYNC_OPERATION, *PPH_IASYNC_OPERATION;
+typedef struct _PH_IASYNC_OPERATION_WITH_PROGRESS PH_IASYNC_OPERATION_WITH_PROGRESS, *PPH_IASYNC_OPERATION_WITH_PROGRESS;
+
+//
+// Generic handler for the Windows Runtime parameterized delegates
+// IAsyncOperationCompletedHandler<TResult> and IAsyncOperationWithProgressCompletedHandler<TResult, TProgress>.
+// Both share an identical vtable layout (IUnknown + Invoke), so a single implementation serves
+// either operation type at the ABI level. The handler records the final
+// AsyncStatus and signals an event the awaiting thread blocks on, replacing the
+// busy-polling of IAsyncInfo::get_Status. (dmex)
+//
+
+typedef struct _PH_ASYNC_COMPLETED_HANDLER_VTBL
+{
+    DECLSPEC_XFGVIRT(IUnknown, QueryInterface)
+    HRESULT (STDMETHODCALLTYPE *QueryInterface)(
+        _In_ PPH_ASYNC_COMPLETED_HANDLER This,
+        _In_ REFIID Riid,
+        _Outptr_ PVOID *Object
+        );
+    DECLSPEC_XFGVIRT(IUnknown, AddRef)
+    ULONG (STDMETHODCALLTYPE *AddRef)(
+        _In_ PPH_ASYNC_COMPLETED_HANDLER This
+        );
+    DECLSPEC_XFGVIRT(IUnknown, Release)
+    ULONG (STDMETHODCALLTYPE *Release)(
+        _In_ PPH_ASYNC_COMPLETED_HANDLER This
+        );
+    DECLSPEC_XFGVIRT(PH_ASYNC_COMPLETED_HANDLER, Invoke)
+    HRESULT (STDMETHODCALLTYPE *Invoke)(
+        _In_ PPH_ASYNC_COMPLETED_HANDLER This,
+        _In_ PVOID AsyncInfo,
+        _In_ AsyncStatus Status
+        );
+} PH_ASYNC_COMPLETED_HANDLER_VTBL;
+
+typedef struct _PH_ASYNC_COMPLETED_HANDLER
+{
+    const PH_ASYNC_COMPLETED_HANDLER_VTBL *lpVtbl;
+    LONG RefCount;
+    HANDLE EventHandle;
+    AsyncStatus Status;
+    IID InterfaceId;
+} PH_ASYNC_COMPLETED_HANDLER, *PPH_ASYNC_COMPLETED_HANDLER;
+
+//
+// Generic vtable shapes for the typed async operation interfaces. Only the slot
+// positions matter (the unused IInspectable members take PVOID), so these mirror
+// the ABI without dragging in the per-type MIDL definitions. IAsyncOperation and
+// IAsyncOperationWithProgress differ: the latter inserts put_Progress/get_Progress
+// before put_Completed, shifting put_Completed and GetResults. (dmex)
+//
+
+typedef struct _PH_IASYNC_OPERATION_VTBL
+{
+    // IUnknown
+    DECLSPEC_XFGVIRT(IUnknown, QueryInterface)
+    HRESULT (STDMETHODCALLTYPE *QueryInterface)(_In_ PPH_IASYNC_OPERATION This, _In_ REFIID Riid, _Outptr_ PVOID *Object);
+    DECLSPEC_XFGVIRT(IUnknown, AddRef)
+    ULONG (STDMETHODCALLTYPE *AddRef)(_In_ PPH_IASYNC_OPERATION This);
+    DECLSPEC_XFGVIRT(IUnknown, Release)
+    ULONG (STDMETHODCALLTYPE *Release)(_In_ PPH_IASYNC_OPERATION This);
+    // IInspectable
+    DECLSPEC_XFGVIRT(IInspectable, GetIids)
+    HRESULT (STDMETHODCALLTYPE *GetIids)(_In_ PPH_IASYNC_OPERATION This, _Out_ PULONG Count, _Outptr_ PVOID *Ids);
+    DECLSPEC_XFGVIRT(IInspectable, GetRuntimeClassName)
+    HRESULT (STDMETHODCALLTYPE *GetRuntimeClassName)(_In_ PPH_IASYNC_OPERATION This, _Out_ PVOID ClassName);
+    DECLSPEC_XFGVIRT(IInspectable, GetTrustLevel)
+    HRESULT (STDMETHODCALLTYPE *GetTrustLevel)(_In_ PPH_IASYNC_OPERATION This, _Out_ PVOID TrustLevel);
+    // IAsyncOperation<TResult>
+    DECLSPEC_XFGVIRT(PH_IASYNC_OPERATION, put_Completed)
+    HRESULT (STDMETHODCALLTYPE *put_Completed)(_In_ PPH_IASYNC_OPERATION This, _In_ PVOID Handler);
+    DECLSPEC_XFGVIRT(PH_IASYNC_OPERATION, get_Completed)
+    HRESULT (STDMETHODCALLTYPE *get_Completed)(_In_ PPH_IASYNC_OPERATION This, _Outptr_ PVOID *Handler);
+    DECLSPEC_XFGVIRT(PH_IASYNC_OPERATION, GetResults)
+    HRESULT (STDMETHODCALLTYPE *GetResults)(_In_ PPH_IASYNC_OPERATION This, _Out_ PVOID Results);
+} PH_IASYNC_OPERATION_VTBL;
+
+typedef struct _PH_IASYNC_OPERATION
+{
+    const PH_IASYNC_OPERATION_VTBL *lpVtbl;
+} PH_IASYNC_OPERATION, *PPH_IASYNC_OPERATION;
+
+typedef struct _PH_IASYNC_OPERATION_WITH_PROGRESS_VTBL
+{
+    // IUnknown
+    DECLSPEC_XFGVIRT(IUnknown, QueryInterface)
+    HRESULT (STDMETHODCALLTYPE *QueryInterface)(
+        _In_ PPH_IASYNC_OPERATION_WITH_PROGRESS This,
+        _In_ REFIID Riid,
+        _Outptr_ PVOID *Object
+        );
+    DECLSPEC_XFGVIRT(IUnknown, AddRef)
+    ULONG (STDMETHODCALLTYPE *AddRef)(_In_ PPH_IASYNC_OPERATION_WITH_PROGRESS This);
+    DECLSPEC_XFGVIRT(IUnknown, Release)
+    ULONG (STDMETHODCALLTYPE *Release)(_In_ PPH_IASYNC_OPERATION_WITH_PROGRESS This);
+    // IInspectable
+    DECLSPEC_XFGVIRT(IInspectable, GetIids)
+    HRESULT (STDMETHODCALLTYPE *GetIids)(_In_ PPH_IASYNC_OPERATION_WITH_PROGRESS This, _Out_ PULONG Count, _Outptr_ PVOID *Ids);
+    DECLSPEC_XFGVIRT(IInspectable, GetRuntimeClassName)
+    HRESULT (STDMETHODCALLTYPE *GetRuntimeClassName)(_In_ PPH_IASYNC_OPERATION_WITH_PROGRESS This, _Out_ PVOID ClassName);
+    DECLSPEC_XFGVIRT(IInspectable, GetTrustLevel)
+    HRESULT (STDMETHODCALLTYPE *GetTrustLevel)(_In_ PPH_IASYNC_OPERATION_WITH_PROGRESS This, _Out_ PVOID TrustLevel);
+    // IAsyncOperationWithProgress<TResult, TProgress>
+    DECLSPEC_XFGVIRT(PH_IASYNC_OPERATION_WITH_PROGRESS, put_Progress)
+    HRESULT (STDMETHODCALLTYPE *put_Progress)(_In_ PPH_IASYNC_OPERATION_WITH_PROGRESS This, _In_ PVOID Handler);
+    DECLSPEC_XFGVIRT(PH_IASYNC_OPERATION_WITH_PROGRESS, get_Progress)
+    HRESULT (STDMETHODCALLTYPE *get_Progress)(_In_ PPH_IASYNC_OPERATION_WITH_PROGRESS This, _Outptr_ PVOID *Handler);
+    DECLSPEC_XFGVIRT(PH_IASYNC_OPERATION_WITH_PROGRESS, put_Completed)
+    HRESULT (STDMETHODCALLTYPE *put_Completed)(_In_ PPH_IASYNC_OPERATION_WITH_PROGRESS This, _In_ PVOID Handler);
+    DECLSPEC_XFGVIRT(PH_IASYNC_OPERATION_WITH_PROGRESS, get_Completed)
+    HRESULT (STDMETHODCALLTYPE *get_Completed)(_In_ PPH_IASYNC_OPERATION_WITH_PROGRESS This, _Outptr_ PVOID *Handler);
+    DECLSPEC_XFGVIRT(PH_IASYNC_OPERATION_WITH_PROGRESS, GetResults)
+    HRESULT (STDMETHODCALLTYPE *GetResults)(_In_ PPH_IASYNC_OPERATION_WITH_PROGRESS This, _Out_ PVOID Results);
+} PH_IASYNC_OPERATION_WITH_PROGRESS_VTBL;
+
+typedef struct _PH_IASYNC_OPERATION_WITH_PROGRESS
+{
+    const PH_IASYNC_OPERATION_WITH_PROGRESS_VTBL *lpVtbl;
+} PH_IASYNC_OPERATION_WITH_PROGRESS, *PPH_IASYNC_OPERATION_WITH_PROGRESS;
+
+HRESULT STDMETHODCALLTYPE PhAsyncCompletedHandlerQueryInterface(
+    _In_ PPH_ASYNC_COMPLETED_HANDLER This,
+    _In_ REFIID Riid,
+    _Outptr_ PVOID *Object
+    )
+{
+    if (!Object)
+        return E_POINTER;
+
+    if (IsEqualIID(Riid, &IID_IUnknown) || IsEqualIID(Riid, &This->InterfaceId))
+    {
+        *Object = This;
+        InterlockedIncrement(&This->RefCount);
+        return S_OK;
+    }
+
+    *Object = NULL;
+    return E_NOINTERFACE;
+}
+
+ULONG STDMETHODCALLTYPE PhAsyncCompletedHandlerAddRef(
+    _In_ PPH_ASYNC_COMPLETED_HANDLER This
+    )
+{
+    return (ULONG)InterlockedIncrement(&This->RefCount);
+}
+
+ULONG STDMETHODCALLTYPE PhAsyncCompletedHandlerRelease(
+    _In_ PPH_ASYNC_COMPLETED_HANDLER This
+    )
+{
+    ULONG count;
+
+    count = (ULONG)InterlockedDecrement(&This->RefCount);
+
+    if (count == 0)
+    {
+        PhFree(This);
+    }
+
+    return count;
+}
+
+HRESULT STDMETHODCALLTYPE PhAsyncCompletedHandlerInvoke(
+    _In_ PPH_ASYNC_COMPLETED_HANDLER This,
+    _In_ PVOID AsyncInfo,
+    _In_ AsyncStatus Status
+    )
+{
+    This->Status = Status;
+
+    NtSetEvent(This->EventHandle, NULL);
+
+    return S_OK;
+}
+
+static const PH_ASYNC_COMPLETED_HANDLER_VTBL PhAsyncCompletedHandlerVtbl =
+{
+    PhAsyncCompletedHandlerQueryInterface,
+    PhAsyncCompletedHandlerAddRef,
+    PhAsyncCompletedHandlerRelease,
+    PhAsyncCompletedHandlerInvoke
+};
+
+PPH_ASYNC_COMPLETED_HANDLER PhCreateAsyncCompletedHandler(
+    _In_ HANDLE EventHandle,
+    _In_ REFIID HandlerId
+    )
+{
+    PPH_ASYNC_COMPLETED_HANDLER handler;
+
+    handler = PhAllocateZero(sizeof(PH_ASYNC_COMPLETED_HANDLER));
+    handler->lpVtbl = &PhAsyncCompletedHandlerVtbl;
+    handler->RefCount = 1;
+    handler->EventHandle = EventHandle;
+    handler->Status = Started;
+    handler->InterfaceId = *HandlerId;
+
+    return handler;
+}
+
+// Translates the recorded AsyncStatus into an HRESULT, querying the operation's
+// IAsyncInfo for the underlying error code when the operation did not complete.
+HRESULT PhAsyncOperationStatusToResult(
+    _In_ PVOID Operation,
+    _In_ AsyncStatus Status
+    )
+{
+    HRESULT result = E_FAIL;
+    IAsyncInfo *asyncInfo = NULL;
+    HRESULT errorCode = E_FAIL;
+
+    if (Status == Canceled)
+        return HRESULT_FROM_WIN32(ERROR_CANCELLED);
+
+    if (HR_SUCCESS(IUnknown_QueryInterface(((IUnknown*)Operation), &IID_IAsyncInfo, &asyncInfo)))
+    {
+        if (HR_SUCCESS(IAsyncInfo_get_ErrorCode(asyncInfo, &errorCode)) && HR_FAILED(errorCode))
+        {
+            result = errorCode;
+        }
+
+        IAsyncInfo_Release(asyncInfo);
+    }
+
+    return result;
+}
+
+/**
+ * Blocks the calling thread until a Windows Runtime IAsyncOperation
+ * completes, fails, or is cancelled, then retrieves its result.
+ *
+ * \param Operation The IAsyncOperation<TResult> interface pointer.
+ * \param HandlerId The IID of IAsyncOperationCompletedHandler<TResult> (used to
+ * answer QueryInterface on the registered completion handler).
+ * \param Result Receives the operation result on success (passed through to
+ * GetResults; the caller supplies a pointer of the appropriate TResult shape).
+ * \return HRESULT Successful or errant status.
+ */
+HRESULT PhWaitForAsyncOperation(
+    _In_ PVOID Operation,
+    _In_ REFIID HandlerId,
+    _Out_ PVOID Result
+    )
+{
+    HRESULT result;
+    NTSTATUS status;
+    HANDLE eventHandle = NULL;
+    PPH_IASYNC_OPERATION operation = Operation;
+    PPH_ASYNC_COMPLETED_HANDLER handler;
+
+    status = PhCreateEvent(
+        &eventHandle,
+        EVENT_ALL_ACCESS,
+        NotificationEvent,
+        FALSE
+        );
+
+    if (!NT_SUCCESS(status))
+        return HRESULT_FROM_NT(status);
+
+    handler = PhCreateAsyncCompletedHandler(eventHandle, HandlerId);
+
+    // WinRT invokes the handler immediately if the operation already completed,
+    // so there is no lost-wakeup race between put_Completed and the wait. (dmex)
+    result = operation->lpVtbl->put_Completed(operation, handler);
+
+    if (HR_SUCCESS(result))
+    {
+        status = PhWaitForSingleObject(eventHandle, INFINITE);
+
+        if (NT_SUCCESS(status))
+        {
+            if (handler->Status == Completed)
+                result = operation->lpVtbl->GetResults(operation, Result);
+            else
+                result = PhAsyncOperationStatusToResult(Operation, handler->Status);
+        }
+        else
+        {
+            result = HRESULT_FROM_NT(status);
+        }
+    }
+
+    handler->lpVtbl->Release(handler);
+    NtClose(eventHandle);
+
+    return result;
+}
+
+/**
+ * \brief Blocks the calling thread until a Windows Runtime
+ * IAsyncOperationWithProgress completes, fails, or is cancelled, then retrieves
+ * its result.
+ *
+ * \param Operation The IAsyncOperationWithProgress<TResult, TProgress> pointer.
+ * \param HandlerId The IID of
+ * IAsyncOperationWithProgressCompletedHandler<TResult, TProgress>.
+ * \param ProgressHandler The
+ * AsyncOperationProgressHandler<TResult, TProgress> delegate to receive progress
+ * updates.
+ * \param Result Receives the operation result on success.
+ * \return HRESULT Successful or errant status.
+ */
+HRESULT PhWaitForAsyncOperationWithProgress(
+    _In_ PVOID Operation,
+    _In_ REFIID HandlerId,
+    _In_ PVOID ProgressHandler,
+    _Out_ PVOID Result
+    )
+{
+    HRESULT result;
+    NTSTATUS status;
+    HANDLE eventHandle = NULL;
+    PPH_IASYNC_OPERATION_WITH_PROGRESS operation = Operation;
+    PPH_ASYNC_COMPLETED_HANDLER handler;
+
+    status = PhCreateEvent(
+        &eventHandle,
+        EVENT_ALL_ACCESS,
+        NotificationEvent,
+        FALSE
+        );
+
+    if (!NT_SUCCESS(status))
+        return HRESULT_FROM_NT(status);
+
+    handler = PhCreateAsyncCompletedHandler(eventHandle, HandlerId);
+
+    result = operation->lpVtbl->put_Progress(operation, ProgressHandler);
+
+    if (HR_SUCCESS(result))
+    {
+        // WinRT invokes the handler immediately if the operation already completed,
+        // so there is no lost-wakeup race between put_Completed and the wait. (dmex)
+        result = operation->lpVtbl->put_Completed(operation, handler);
+    }
+
+    if (HR_SUCCESS(result))
+    {
+        status = PhWaitForSingleObject(eventHandle, INFINITE);
+
+        if (NT_SUCCESS(status))
+        {
+            if (handler->Status == Completed)
+                result = operation->lpVtbl->GetResults(operation, Result);
+            else
+                result = PhAsyncOperationStatusToResult(Operation, handler->Status);
+        }
+        else
+        {
+            result = HRESULT_FROM_NT(status);
+        }
+    }
+
+    handler->lpVtbl->Release(handler);
+    NtClose(eventHandle);
+
+    return result;
+}
+
+#pragma endregion

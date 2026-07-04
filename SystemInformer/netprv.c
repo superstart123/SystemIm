@@ -1,0 +1,2337 @@
+/*
+ * Copyright (c) 2022 Winsider Seminars & Solutions, Inc.  All rights reserved.
+ *
+ * This file is part of System Informer.
+ *
+ * Authors:
+ *
+ *     wj32    2010
+ *     evilpie 2010
+ *     dmex    2016-2026
+ *
+ */
+
+#include <phapp.h>
+#include <phplug.h>
+#include <phsettings.h>
+#include <extmgri.h>
+#include <mapldr.h>
+#include <netprv.h>
+#include <procprv.h>
+#include <svcsup.h>
+#include <workqueue.h>
+#include <hvsocketcontrol.h>
+#include <trace.h>
+
+typedef struct _PH_NETWORK_CONNECTION
+{
+    ULONG ProtocolType;
+    PH_IP_ENDPOINT LocalEndpoint;
+    PH_IP_ENDPOINT RemoteEndpoint;
+    MIB_TCP_STATE State;
+    HANDLE ProcessId;
+    LARGE_INTEGER CreateTime;
+    ULONGLONG OwnerInfo[PH_NETWORK_OWNER_INFO_SIZE];
+    ULONG LocalScopeId; // Ipv6
+    ULONG RemoteScopeId; // Ipv6
+} PH_NETWORK_CONNECTION, *PPH_NETWORK_CONNECTION;
+
+typedef struct _PH_NETWORK_ITEM_QUERY_DATA
+{
+    SLIST_ENTRY ListEntry;
+    PPH_NETWORK_ITEM NetworkItem;
+
+    PH_IP_ADDRESS Address;
+    BOOLEAN Remote;
+    PPH_STRING HostString;
+} PH_NETWORK_ITEM_QUERY_DATA, *PPH_NETWORK_ITEM_QUERY_DATA;
+
+typedef struct _PHP_RESOLVE_CACHE_ITEM
+{
+    PH_IP_ADDRESS Address;
+    PPH_STRING HostString;
+} PHP_RESOLVE_CACHE_ITEM, *PPHP_RESOLVE_CACHE_ITEM;
+
+_Function_class_(PH_TYPE_DELETE_PROCEDURE)
+VOID NTAPI PhpNetworkItemDeleteProcedure(
+    _In_ PVOID Object,
+    _In_ ULONG Flags
+    );
+
+_Function_class_(PH_HASHTABLE_EQUAL_FUNCTION)
+BOOLEAN PhpResolveCacheHashtableEqualFunction(
+    _In_ PVOID Entry1,
+    _In_ PVOID Entry2
+    );
+
+_Function_class_(PH_HASHTABLE_HASH_FUNCTION)
+ULONG NTAPI PhpResolveCacheHashtableHashFunction(
+    _In_ PVOID Entry
+    );
+
+_Success_(return)
+BOOLEAN PhGetNetworkConnections(
+    _Out_ PPH_NETWORK_CONNECTION *Connections,
+    _Out_ PULONG NumberOfConnections
+    );
+
+PPH_OBJECT_TYPE PhNetworkItemType = NULL;
+PH_QUEUED_LOCK PhNetworkHashSetLock = PH_QUEUED_LOCK_INIT;
+PPH_HASH_ENTRY PhNetworkHashSet[256] = PH_HASH_SET_INIT;
+ULONG PhNetworkHashSetCount = 0;
+
+PH_INITONCE PhNetworkProviderWorkQueueInitOnce = PH_INITONCE_INIT;
+PH_WORK_QUEUE PhNetworkProviderWorkQueue;
+SLIST_HEADER PhNetworkItemQueryListHead;
+
+BOOLEAN PhEnableNetworkProviderResolve = TRUE;
+BOOLEAN PhEnableNetworkBoundConnections = TRUE;
+ULONG PhNetworkProviderFlagsMask = 0;
+static PPH_HASHTABLE PhpResolveCacheHashtable = NULL;
+static PH_QUEUED_LOCK PhpResolveCacheHashtableLock = PH_QUEUED_LOCK_INIT;
+
+static BOOLEAN NetworkImportDone = FALSE;
+static _GetExtendedTcpTable GetExtendedTcpTable_I = NULL;
+static _GetExtendedUdpTable GetExtendedUdpTable_I = NULL;
+static _InternalGetBoundTcpEndpointTable GetBoundTcpEndpointTable_I = NULL;
+static _InternalGetBoundTcp6EndpointTable GetBoundTcp6EndpointTable_I = NULL;
+
+/**
+ * Initializes the network provider.
+ *
+ * \return TRUE if successful, FALSE otherwise.
+ */
+BOOLEAN PhNetworkProviderInitialization(
+    VOID
+    )
+{
+    PhNetworkItemType = PhCreateObjectType(L"NetworkItem", 0, PhpNetworkItemDeleteProcedure);
+
+    PhInitializeSListHead(&PhNetworkItemQueryListHead);
+
+    PhpResolveCacheHashtable = PhCreateHashtable(
+        sizeof(PPHP_RESOLVE_CACHE_ITEM),
+        PhpResolveCacheHashtableEqualFunction,
+        PhpResolveCacheHashtableHashFunction,
+        20
+        );
+
+    return TRUE;
+}
+
+/**
+ * Creates a network item.
+ *
+ * \return A pointer to the created network item.
+ */
+PPH_NETWORK_ITEM PhCreateNetworkItem(
+    VOID
+    )
+{
+    PPH_NETWORK_ITEM networkItem;
+
+    networkItem = PhCreateObject(
+        PhEmGetObjectSize(EmNetworkItemType, sizeof(PH_NETWORK_ITEM)),
+        PhNetworkItemType
+        );
+    memset(networkItem, 0, sizeof(PH_NETWORK_ITEM));
+    PhEmCallObjectOperation(EmNetworkItemType, networkItem, EmObjectCreate);
+
+    return networkItem;
+}
+
+/**
+ * Deletes a network item.
+ *
+ * \param[in] Object A pointer to the network item object.
+ * \param[in] Flags Reserved.
+ */
+_Function_class_(PH_TYPE_DELETE_PROCEDURE)
+VOID NTAPI PhpNetworkItemDeleteProcedure(
+    _In_ PVOID Object,
+    _In_ ULONG Flags
+    )
+{
+    PPH_NETWORK_ITEM networkItem = (PPH_NETWORK_ITEM)Object;
+
+    PhEmCallObjectOperation(EmNetworkItemType, networkItem, EmObjectDelete);
+
+    if (networkItem->LocalAddressString)
+        PhDereferenceObject(networkItem->LocalAddressString);
+    if (networkItem->RemoteAddressString)
+        PhDereferenceObject(networkItem->RemoteAddressString);
+    if (networkItem->ProcessName)
+        PhDereferenceObject(networkItem->ProcessName);
+    if (networkItem->OwnerName)
+        PhDereferenceObject(networkItem->OwnerName);
+    if (networkItem->LocalHostString)
+        PhDereferenceObject(networkItem->LocalHostString);
+    if (networkItem->RemoteHostString)
+        PhDereferenceObject(networkItem->RemoteHostString);
+    if (networkItem->HvService)
+        PhDereferenceObject(networkItem->HvService);
+
+    // NOTE: Dereferencing the ProcessItem will destroy the NetworkItem->ProcessIcon handle.
+    if (networkItem->ProcessItem)
+        PhDereferenceObject(networkItem->ProcessItem);
+}
+
+/**
+ * Compares two network items.
+ *
+ * \param[in] Value1 The first network item.
+ * \param[in] Value2 The second network item.
+ * \return TRUE if the network items are equal, FALSE otherwise.
+ */
+FORCEINLINE BOOLEAN PhCompareNetworkItem(
+    _In_ PPH_NETWORK_ITEM Value1,
+    _In_ PPH_NETWORK_ITEM Value2
+    )
+{
+    return
+        Value1->ProtocolType == Value2->ProtocolType &&
+        PhEqualIpEndpoint(&Value1->LocalEndpoint, &Value2->LocalEndpoint) &&
+        PhEqualIpEndpoint(&Value1->RemoteEndpoint, &Value2->RemoteEndpoint) &&
+        Value1->ProcessId == Value2->ProcessId;
+}
+
+/**
+ * Hashes a network item.
+ *
+ * \param[in] Value The network item.
+ * \return The hash of the network item.
+ */
+FORCEINLINE ULONG PhHashNetworkItem(
+    _In_ PPH_NETWORK_ITEM Value
+    )
+{
+    return
+        Value->ProtocolType ^
+        PhHashIpEndpoint(&Value->LocalEndpoint) ^
+        PhHashIpEndpoint(&Value->RemoteEndpoint) ^
+        (HandleToUlong(Value->ProcessId) / 4);
+}
+
+/**
+ * Looks up a network item.
+ *
+ * \param[in] ProtocolType The protocol type.
+ * \param[in] LocalEndpoint The local endpoint.
+ * \param[in] RemoteEndpoint The remote endpoint.
+ * \param[in] ProcessId The process ID.
+ * \return A pointer to the network item, or NULL if not found.
+ */
+PPH_NETWORK_ITEM PhpLookupNetworkItem(
+    _In_ ULONG ProtocolType,
+    _In_ PPH_IP_ENDPOINT LocalEndpoint,
+    _In_ PPH_IP_ENDPOINT RemoteEndpoint,
+    _In_ HANDLE ProcessId
+    )
+{
+    PH_NETWORK_ITEM lookupNetworkItem;
+    PPH_HASH_ENTRY entry;
+    PPH_NETWORK_ITEM networkItem;
+
+    lookupNetworkItem.ProtocolType = ProtocolType;
+    lookupNetworkItem.LocalEndpoint = *LocalEndpoint;
+    lookupNetworkItem.RemoteEndpoint = *RemoteEndpoint;
+    lookupNetworkItem.ProcessId = ProcessId;
+
+    entry = PhFindEntryHashSet(
+        PhNetworkHashSet,
+        PH_HASH_SET_SIZE(PhNetworkHashSet),
+        PhHashNetworkItem(&lookupNetworkItem)
+        );
+
+    for (; entry; entry = entry->Next)
+    {
+        networkItem = CONTAINING_RECORD(entry, PH_NETWORK_ITEM, HashEntry);
+
+        if (PhCompareNetworkItem(&lookupNetworkItem, networkItem))
+            return networkItem;
+    }
+
+    return NULL;
+}
+
+/**
+ * References a network item.
+ *
+ * \param[in] ProtocolType The protocol type.
+ * \param[in] LocalEndpoint The local endpoint.
+ * \param[in] RemoteEndpoint The remote endpoint.
+ * \param[in] ProcessId The process ID.
+ * \return A pointer to the network item, or NULL if not found.
+ */
+PPH_NETWORK_ITEM PhReferenceNetworkItem(
+    _In_ ULONG ProtocolType,
+    _In_ PPH_IP_ENDPOINT LocalEndpoint,
+    _In_ PPH_IP_ENDPOINT RemoteEndpoint,
+    _In_ HANDLE ProcessId
+    )
+{
+    PPH_NETWORK_ITEM networkItem;
+
+    PhAcquireQueuedLockShared(&PhNetworkHashSetLock);
+
+    networkItem = PhpLookupNetworkItem(
+        ProtocolType,
+        LocalEndpoint,
+        RemoteEndpoint,
+        ProcessId
+        );
+
+    if (networkItem)
+        PhReferenceObject(networkItem);
+
+    PhReleaseQueuedLockShared(&PhNetworkHashSetLock);
+
+    return networkItem;
+}
+
+/**
+ * Enumerates the network items.
+ *
+ * \param[out] NetworkItems A variable which receives an array of pointers to network items. You must
+ * free the buffer with PhFree() when you no longer need it.
+ * \param[out] NumberOfNetworkItems A variable which receives the number of network items.
+ */
+VOID PhEnumNetworkItems(
+    _Out_opt_ PPH_NETWORK_ITEM **NetworkItems,
+    _Out_ PULONG NumberOfNetworkItems
+    )
+{
+    PPH_NETWORK_ITEM* networkItems;
+    ULONG numberOfNetworkItems;
+    ULONG count = 0;
+    ULONG i;
+    PPH_HASH_ENTRY entry;
+    PPH_NETWORK_ITEM networkItem;
+
+    PhAcquireQueuedLockShared(&PhNetworkHashSetLock);
+
+    count = PhNetworkHashSetCount;
+
+    if (count == 0)
+    {
+        PhReleaseQueuedLockShared(&PhNetworkHashSetLock);
+
+        if (NetworkItems) *NetworkItems = NULL;
+        *NumberOfNetworkItems = count;
+        return;
+    }
+
+    numberOfNetworkItems = count;
+    networkItems = PhAllocate(sizeof(PPH_NETWORK_ITEM) * numberOfNetworkItems);
+    count = 0;
+
+    for (i = 0; i < PH_HASH_SET_SIZE(PhNetworkHashSet); i++)
+    {
+        for (entry = PhNetworkHashSet[i]; entry; entry = entry->Next)
+        {
+            networkItem = CONTAINING_RECORD(entry, PH_NETWORK_ITEM, HashEntry);
+            PhReferenceObject(networkItem);
+            networkItems[count++] = networkItem;
+        }
+    }
+
+    PhReleaseQueuedLockShared(&PhNetworkHashSetLock);
+
+    *NetworkItems = networkItems;
+    *NumberOfNetworkItems = numberOfNetworkItems;
+}
+
+/**
+ * Enumerates network items by process ID.
+ *
+ * \param[in] ProcessId The process ID to filter by.
+ * \param[out] NetworkItems A variable which receives an array of pointers to network items. You must
+ * free the buffer with PhFree() when you no longer need it.
+ * \param[out] NumberOfNetworkItems A variable which receives the number of network items.
+ */
+VOID PhEnumNetworkItemsByProcessId(
+    _In_opt_ HANDLE ProcessId,
+    _Out_opt_ PPH_NETWORK_ITEM** NetworkItems,
+    _Out_ PULONG NumberOfNetworkItems
+    )
+{
+    PPH_NETWORK_ITEM* networkItems;
+    ULONG numberOfNetworkItems;
+    ULONG count = 0;
+    ULONG i;
+    PPH_HASH_ENTRY entry;
+    PPH_NETWORK_ITEM networkItem;
+
+    PhAcquireQueuedLockShared(&PhNetworkHashSetLock);
+
+    for (i = 0; i < PH_HASH_SET_SIZE(PhNetworkHashSet); i++)
+    {
+        for (entry = PhNetworkHashSet[i]; entry; entry = entry->Next)
+        {
+            networkItem = CONTAINING_RECORD(entry, PH_NETWORK_ITEM, HashEntry);
+
+            if (networkItem->ProcessId == ProcessId)
+            {
+                count++;
+            }
+        }
+    }
+
+    if (count == 0)
+    {
+        PhReleaseQueuedLockShared(&PhNetworkHashSetLock);
+
+        if (NetworkItems) *NetworkItems = NULL;
+        *NumberOfNetworkItems = count;
+        return;
+    }
+
+    numberOfNetworkItems = count;
+    networkItems = PhAllocate(sizeof(PPH_NETWORK_ITEM) * numberOfNetworkItems);
+    count = 0;
+
+    for (i = 0; i < PH_HASH_SET_SIZE(PhNetworkHashSet); i++)
+    {
+        for (entry = PhNetworkHashSet[i]; entry; entry = entry->Next)
+        {
+            networkItem = CONTAINING_RECORD(entry, PH_NETWORK_ITEM, HashEntry);
+
+            if (networkItem->ProcessId == ProcessId)
+            {
+                PhReferenceObject(networkItem);
+                networkItems[count++] = networkItem;
+            }
+        }
+    }
+
+    PhReleaseQueuedLockShared(&PhNetworkHashSetLock);
+
+    *NetworkItems = networkItems;
+    *NumberOfNetworkItems = numberOfNetworkItems;
+}
+
+/**
+ * Removes a network item from the hash set.
+ *
+ * \param[in] NetworkItem The network item to remove.
+ */
+VOID PhpRemoveNetworkItem(
+    _In_ PPH_NETWORK_ITEM NetworkItem
+    )
+{
+    PhRemoveEntryHashSet(PhNetworkHashSet, PH_HASH_SET_SIZE(PhNetworkHashSet), &NetworkItem->HashEntry);
+    PhNetworkHashSetCount--;
+    PhDereferenceObject(NetworkItem);
+}
+
+/**
+ * Equality function for the resolve cache hashtable.
+ *
+ * \param[in] Entry1 The first entry.
+ * \param[in] Entry2 The second entry.
+ * \return TRUE if the entries are equal, FALSE otherwise.
+ */
+_Function_class_(PH_HASHTABLE_EQUAL_FUNCTION)
+BOOLEAN NTAPI PhpResolveCacheHashtableEqualFunction(
+    _In_ PVOID Entry1,
+    _In_ PVOID Entry2
+    )
+{
+    PPHP_RESOLVE_CACHE_ITEM cacheItem1 = *(PPHP_RESOLVE_CACHE_ITEM *)Entry1;
+    PPHP_RESOLVE_CACHE_ITEM cacheItem2 = *(PPHP_RESOLVE_CACHE_ITEM *)Entry2;
+
+    return PhEqualIpAddress(&cacheItem1->Address, &cacheItem2->Address);
+}
+
+/**
+ * Hash function for the resolve cache hashtable.
+ *
+ * \param[in] Entry The entry to hash.
+ * \return The hash value of the entry.
+ */
+_Function_class_(PH_HASHTABLE_HASH_FUNCTION)
+ULONG NTAPI PhpResolveCacheHashtableHashFunction(
+    _In_ PVOID Entry
+    )
+{
+    PPHP_RESOLVE_CACHE_ITEM cacheItem = *(PPHP_RESOLVE_CACHE_ITEM *)Entry;
+
+    return PhHashIpAddress(&cacheItem->Address);
+}
+
+/**
+ * Looks up an item in the resolve cache.
+ *
+ * \param[in] Address The IP address to look up.
+ * \return A pointer to the cache item, or NULL if not found.
+ */
+PPHP_RESOLVE_CACHE_ITEM PhpLookupResolveCacheItem(
+    _In_ PPH_IP_ADDRESS Address
+    )
+{
+    PHP_RESOLVE_CACHE_ITEM lookupCacheItem;
+    PPHP_RESOLVE_CACHE_ITEM lookupCacheItemPtr = &lookupCacheItem;
+    PPHP_RESOLVE_CACHE_ITEM *cacheItemPtr;
+
+    // Construct a temporary cache item for the lookup.
+    lookupCacheItem.Address = *Address;
+
+    cacheItemPtr = (PPHP_RESOLVE_CACHE_ITEM *)PhFindEntryHashtable(
+        PhpResolveCacheHashtable,
+        &lookupCacheItemPtr
+        );
+
+    if (cacheItemPtr)
+        return *cacheItemPtr;
+    else
+        return NULL;
+}
+
+//PPH_STRING PhGetHostNameFromAddress(
+//    _In_ PPH_IP_ADDRESS Address
+//    )
+//{
+//    SOCKADDR_IN ipv4Address;
+//    SOCKADDR_IN6 ipv6Address;
+//    PSOCKADDR address;
+//    socklen_t length;
+//    PPH_STRING hostName;
+//
+//    if (Address->Type == PH_NETWORK_TYPE_IPV4)
+//    {
+//        ipv4Address.sin_family = AF_INET;
+//        ipv4Address.sin_port = 0;
+//        ipv4Address.sin_addr = Address->InAddr;
+//        address = (PSOCKADDR)&ipv4Address;
+//        length = sizeof(ipv4Address);
+//    }
+//    else if (Address->Type == PH_NETWORK_TYPE_IPV6)
+//    {
+//        ipv6Address.sin6_family = AF_INET6;
+//        ipv6Address.sin6_port = 0;
+//        ipv6Address.sin6_flowinfo = 0;
+//        ipv6Address.sin6_addr = Address->In6Addr;
+//        ipv6Address.sin6_scope_id = 0;
+//        address = (PSOCKADDR)&ipv6Address;
+//        length = sizeof(ipv6Address);
+//    }
+//    else
+//    {
+//        return NULL;
+//    }
+//
+//    hostName = PhCreateStringEx(NULL, 128);
+//
+//    if (GetNameInfo(
+//        address,
+//        length,
+//        hostName->Buffer,
+//        (ULONG)hostName->Length / sizeof(WCHAR) + 1,
+//        NULL,
+//        0,
+//        NI_NAMEREQD
+//        ) != 0)
+//    {
+//        // Try with the maximum host name size.
+//        PhDereferenceObject(hostName);
+//        hostName = PhCreateStringEx(NULL, NI_MAXHOST * sizeof(WCHAR));
+//
+//        if (GetNameInfo(
+//            address,
+//            length,
+//            hostName->Buffer,
+//            (ULONG)hostName->Length / sizeof(WCHAR) + 1,
+//            NULL,
+//            0,
+//            NI_NAMEREQD
+//            ) != 0)
+//        {
+//            PhDereferenceObject(hostName);
+//
+//            return NULL;
+//        }
+//    }
+//
+//    PhTrimToNullTerminatorString(hostName);
+//
+//    return hostName;
+//}
+
+/**
+ * Gets the DNS reverse name from an IP address.
+ *
+ * \param[in] Address The IP address.
+ * \return A pointer to the DNS reverse name string, or NULL if unsuccessful.
+ */
+PPH_STRING PhpGetDnsReverseNameFromAddress(
+    _In_ PPH_IP_ADDRESS Address
+    )
+{
+#define IP4_REVERSE_DOMAIN_STRING_LENGTH (IP4_ADDRESS_STRING_LENGTH + sizeof(DNS_IP4_REVERSE_DOMAIN_STRING_W) + 1)
+#define IP6_REVERSE_DOMAIN_STRING_LENGTH (IP6_ADDRESS_STRING_LENGTH + sizeof(DNS_IP6_REVERSE_DOMAIN_STRING_W) + 1)
+
+    switch (Address->Type)
+    {
+    case PH_NETWORK_TYPE_IPV4:
+        {
+            static CONST PH_STRINGREF reverseLookupDomainNameSr = PH_STRINGREF_INIT(DNS_IP4_REVERSE_DOMAIN_STRING);
+            PH_FORMAT format[9];
+            SIZE_T returnLength;
+            WCHAR reverseNameBuffer[IP4_REVERSE_DOMAIN_STRING_LENGTH];
+
+            PhInitFormatU(&format[0], Address->InAddr.s_impno);
+            PhInitFormatC(&format[1], L'.');
+            PhInitFormatU(&format[2], Address->InAddr.s_lh);
+            PhInitFormatC(&format[3], L'.');
+            PhInitFormatU(&format[4], Address->InAddr.s_host);
+            PhInitFormatC(&format[5], L'.');
+            PhInitFormatU(&format[6], Address->InAddr.s_net);
+            PhInitFormatC(&format[7], L'.');
+            PhInitFormatSR(&format[8], reverseLookupDomainNameSr);
+
+            if (PhFormatToBuffer(
+                format,
+                RTL_NUMBER_OF(format),
+                reverseNameBuffer,
+                sizeof(reverseNameBuffer),
+                &returnLength
+                ))
+            {
+                PH_STRINGREF reverseNameString;
+
+                reverseNameString.Buffer = reverseNameBuffer;
+                reverseNameString.Length = returnLength - sizeof(UNICODE_NULL);
+
+                return PhCreateString2(&reverseNameString);
+            }
+            else
+            {
+                return PhFormat(format, RTL_NUMBER_OF(format), IP4_REVERSE_DOMAIN_STRING_LENGTH);
+            }
+        }
+        break;
+    case PH_NETWORK_TYPE_IPV6:
+        {
+            static CONST PH_STRINGREF reverseLookupDomainNameSr = PH_STRINGREF_INIT(DNS_IP6_REVERSE_DOMAIN_STRING);
+            PH_STRING_BUILDER stringBuilder;
+
+            // DNS_MAX_IP6_REVERSE_NAME_LENGTH
+            PhInitializeStringBuilder(&stringBuilder, IP6_REVERSE_DOMAIN_STRING_LENGTH);
+
+            for (LONG i = sizeof(IN6_ADDR) - 1; i >= 0; i--)
+            {
+                PH_FORMAT format[4];
+                SIZE_T returnLength;
+                WCHAR reverseNameBuffer[PH_INT64_STR_LEN_1];
+
+                PhInitFormatX(&format[0], Address->In6Addr.s6_addr[i] & 0xF);
+                PhInitFormatC(&format[1], L'.');
+                PhInitFormatX(&format[2], (Address->In6Addr.s6_addr[i] >> 4) & 0xF);
+                PhInitFormatC(&format[3], L'.');
+
+                if (PhFormatToBuffer(
+                    format,
+                    RTL_NUMBER_OF(format),
+                    reverseNameBuffer,
+                    sizeof(reverseNameBuffer),
+                    &returnLength
+                    ))
+                {
+                    PH_STRINGREF reverseNameString;
+
+                    reverseNameString.Buffer = reverseNameBuffer;
+                    reverseNameString.Length = returnLength - sizeof(UNICODE_NULL);
+
+                    PhAppendStringBuilder(&stringBuilder, &reverseNameString);
+                }
+                else
+                {
+                    PhAppendFormatStringBuilder(
+                        &stringBuilder,
+                        L"%hhx.%hhx.",
+                        Address->In6Addr.s6_addr[i] & 0xF,
+                        (Address->In6Addr.s6_addr[i] >> 4) & 0xF
+                        );
+                }
+            }
+
+            PhAppendStringBuilder(&stringBuilder, &reverseLookupDomainNameSr);
+
+            return PhFinalStringBuilderString(&stringBuilder);
+        }
+        break;
+    }
+
+    return NULL;
+}
+
+/**
+ * Gets the host name from an IP address.
+ *
+ * \param[in] Address The IP address.
+ * \return A pointer to the host name string, or NULL if unsuccessful.
+ */
+PPH_STRING PhGetHostNameFromAddressEx(
+    _In_ PPH_IP_ADDRESS Address
+    )
+{
+    BOOLEAN dnsLocalQuery = FALSE;
+    PPH_STRING dnsHostNameString = NULL;
+    PPH_STRING dnsReverseNameString = NULL;
+    PDNS_RECORD dnsRecordList;
+
+    switch (Address->Type)
+    {
+    case PH_NETWORK_TYPE_IPV4:
+        {
+            if (IN4_IS_ADDR_UNSPECIFIED(&Address->InAddr))
+                return NULL;
+
+            if (IN4_IS_ADDR_LOOPBACK(&Address->InAddr) ||
+                IN4_IS_ADDR_BROADCAST(&Address->InAddr) ||
+                IN4_IS_ADDR_MULTICAST(&Address->InAddr) ||
+                IN4_IS_ADDR_LINKLOCAL(&Address->InAddr) ||
+                IN4_IS_ADDR_MC_LINKLOCAL(&Address->InAddr) ||
+                IN4_IS_ADDR_RFC1918(&Address->InAddr))
+            {
+                dnsLocalQuery = TRUE;
+            }
+
+            dnsReverseNameString = PhDnsReverseLookupNameFromAddress(PH_NETWORK_TYPE_IPV4, &Address->InAddr);
+        }
+        break;
+    case PH_NETWORK_TYPE_IPV6:
+        {
+            if (IN6_IS_ADDR_UNSPECIFIED(&Address->In6Addr))
+                return NULL;
+
+            if (IN6_IS_ADDR_LOOPBACK(&Address->In6Addr) ||
+                IN6_IS_ADDR_MULTICAST(&Address->In6Addr) ||
+                IN6_IS_ADDR_LINKLOCAL(&Address->In6Addr) ||
+                IN6_IS_ADDR_MC_LINKLOCAL(&Address->In6Addr))
+            {
+                dnsLocalQuery = TRUE;
+            }
+
+            dnsReverseNameString = PhDnsReverseLookupNameFromAddress(PH_NETWORK_TYPE_IPV6, &Address->In6Addr);
+        }
+        break;
+    case PH_NETWORK_TYPE_HYPERV:
+        return PhHvSocketGetVmName(&Address->HvAddr);
+    }
+
+    if (PhIsNullOrEmptyString(dnsReverseNameString))
+        return NULL;
+
+    if (!!PhCsEnableNetworkResolveDoH && !dnsLocalQuery)
+    {
+        dnsRecordList = PhDnsQuery(
+            NULL,
+            dnsReverseNameString->Buffer,
+            DNS_TYPE_PTR
+            );
+    }
+    else
+    {
+        dnsRecordList = PhDnsQuery2(
+            NULL,
+            dnsReverseNameString->Buffer,
+            DNS_TYPE_PTR,
+            DNS_QUERY_NO_HOSTS_FILE // DNS_QUERY_BYPASS_CACHE
+            );
+    }
+
+    if (dnsRecordList)
+    {
+        for (PDNS_RECORD dnsRecord = dnsRecordList; dnsRecord; dnsRecord = dnsRecord->pNext)
+        {
+            if (dnsRecord->wType == DNS_TYPE_PTR)
+            {
+                dnsHostNameString = PhCreateString(dnsRecord->Data.PTR.pNameHost); // Return the first result (dmex)
+                break;
+            }
+        }
+
+        PhDnsFree(dnsRecordList);
+    }
+
+    PhDereferenceObject(dnsReverseNameString);
+
+    return dnsHostNameString;
+}
+
+/**
+ * Flushes the network item resolve cache.
+ */
+VOID PhFlushNetworkItemResolveCache(
+    VOID
+    )
+{
+    PH_HASHTABLE_ENUM_CONTEXT enumContext;
+    PPHP_RESOLVE_CACHE_ITEM* entry;
+
+    if (!PhpResolveCacheHashtable)
+        return;
+
+    PhAcquireQueuedLockExclusive(&PhpResolveCacheHashtableLock);
+
+    PhBeginEnumHashtable(PhpResolveCacheHashtable, &enumContext);
+
+    while (entry = PhNextEnumHashtable(&enumContext))
+    {
+        if ((*entry)->HostString)
+        {
+            PhDereferenceObject((*entry)->HostString);
+        }
+
+        PhFree((*entry));
+    }
+
+    PhDereferenceObject(PhpResolveCacheHashtable);
+    PhpResolveCacheHashtable = PhCreateHashtable(
+        sizeof(PPHP_RESOLVE_CACHE_ITEM),
+        PhpResolveCacheHashtableEqualFunction,
+        PhpResolveCacheHashtableHashFunction,
+        20
+        );
+
+    PhReleaseQueuedLockExclusive(&PhpResolveCacheHashtableLock);
+}
+
+/**
+ * Worker routine for resolving network item host names.
+ *
+ * \param[in] Parameter A pointer to the network item query data.
+ * \return STATUS_SUCCESS.
+ */
+_Function_class_(USER_THREAD_START_ROUTINE)
+NTSTATUS PhpNetworkItemQueryWorker(
+    _In_ PVOID Parameter
+    )
+{
+    PPH_NETWORK_ITEM_QUERY_DATA data = (PPH_NETWORK_ITEM_QUERY_DATA)Parameter;
+    PPH_STRING hostString;
+    PPHP_RESOLVE_CACHE_ITEM cacheItem;
+
+    // Last minute check of the cache.
+
+    PhAcquireQueuedLockShared(&PhpResolveCacheHashtableLock);
+    cacheItem = PhpLookupResolveCacheItem(&data->Address);
+    PhReleaseQueuedLockShared(&PhpResolveCacheHashtableLock);
+
+    if (!cacheItem)
+    {
+        hostString = PhGetHostNameFromAddressEx(&data->Address);
+
+        if (hostString)
+        {
+            data->HostString = hostString;
+
+            // Update the cache.
+
+            PhAcquireQueuedLockExclusive(&PhpResolveCacheHashtableLock);
+
+            cacheItem = PhpLookupResolveCacheItem(&data->Address);
+
+            if (!cacheItem)
+            {
+                cacheItem = PhAllocate(sizeof(PHP_RESOLVE_CACHE_ITEM));
+                cacheItem->Address = data->Address;
+                cacheItem->HostString = hostString;
+                PhReferenceObject(hostString);
+
+                PhAddEntryHashtable(PhpResolveCacheHashtable, &cacheItem);
+            }
+
+            PhReleaseQueuedLockExclusive(&PhpResolveCacheHashtableLock);
+        }
+    }
+    else
+    {
+        PhReferenceObject(cacheItem->HostString);
+        data->HostString = cacheItem->HostString;
+    }
+
+    RtlInterlockedPushEntrySList(&PhNetworkItemQueryListHead, &data->ListEntry);
+
+    return STATUS_SUCCESS;
+}
+
+/**
+ * Queues a network item for host name resolution.
+ *
+ * \param[in] NetworkItem The network item.
+ * \param[in] Remote TRUE to resolve the remote address, FALSE to resolve the local address.
+ */
+VOID PhpQueueNetworkItemQuery(
+    _In_ PPH_NETWORK_ITEM NetworkItem,
+    _In_ BOOLEAN Remote
+    )
+{
+    PPH_NETWORK_ITEM_QUERY_DATA data;
+
+    if (!PhEnableNetworkProviderResolve)
+    {
+        if (Remote)
+            NetworkItem->RemoteHostnameResolved = TRUE;
+        else
+            NetworkItem->LocalHostnameResolved = TRUE;
+        return;
+    }
+
+    data = PhAllocateZero(sizeof(PH_NETWORK_ITEM_QUERY_DATA));
+    data->NetworkItem = NetworkItem;
+    data->Remote = Remote;
+
+    if (Remote)
+        data->Address = NetworkItem->RemoteEndpoint.Address;
+    else
+        data->Address = NetworkItem->LocalEndpoint.Address;
+
+    PhReferenceObject(NetworkItem);
+
+    if (PhBeginInitOnce(&PhNetworkProviderWorkQueueInitOnce))
+    {
+        PhInitializeWorkQueue(&PhNetworkProviderWorkQueue, 0, 3, 500);
+        PhEndInitOnce(&PhNetworkProviderWorkQueueInitOnce);
+    }
+
+    PhQueueItemWorkQueue(&PhNetworkProviderWorkQueue, PhpNetworkItemQueryWorker, data);
+}
+
+/**
+ * Resolves the host names for a network item.
+ *
+ * \param[in] NetworkItem The network item.
+ */
+VOID PhNetworkItemResolveHostname(
+    _In_ PPH_NETWORK_ITEM NetworkItem
+    )
+{
+    PPHP_RESOLVE_CACHE_ITEM cacheItem;
+
+    if (!FlagOn(PhNetworkProviderFlagsMask, PH_NETWORK_PROVIDER_FLAG_HOSTNAME))
+        return;
+
+    // Local
+
+    if (!PhIsNullIpAddress(&NetworkItem->LocalEndpoint.Address))
+    {
+        PhAcquireQueuedLockShared(&PhpResolveCacheHashtableLock);
+        cacheItem = PhpLookupResolveCacheItem(&NetworkItem->LocalEndpoint.Address);
+        PhReleaseQueuedLockShared(&PhpResolveCacheHashtableLock);
+
+        if (cacheItem)
+        {
+            PhReferenceObject(cacheItem->HostString);
+            NetworkItem->LocalHostString = cacheItem->HostString;
+            NetworkItem->LocalHostnameResolved = TRUE;
+        }
+        else
+        {
+            PhpQueueNetworkItemQuery(NetworkItem, FALSE);
+        }
+    }
+    else
+    {
+        NetworkItem->LocalHostnameResolved = TRUE;
+    }
+
+    // Remote
+
+    if (!PhIsNullIpAddress(&NetworkItem->RemoteEndpoint.Address))
+    {
+        PhAcquireQueuedLockShared(&PhpResolveCacheHashtableLock);
+        cacheItem = PhpLookupResolveCacheItem(&NetworkItem->RemoteEndpoint.Address);
+        PhReleaseQueuedLockShared(&PhpResolveCacheHashtableLock);
+
+        if (cacheItem)
+        {
+            PhReferenceObject(cacheItem->HostString);
+            NetworkItem->RemoteHostString = cacheItem->HostString;
+            NetworkItem->RemoteHostnameResolved = TRUE;
+        }
+        else
+        {
+            PhpQueueNetworkItemQuery(NetworkItem, TRUE);
+        }
+    }
+    else
+    {
+        NetworkItem->RemoteHostnameResolved = TRUE;
+    }
+}
+
+/**
+ * Invalidates the host names for a network item and re-resolves them.
+ *
+ * \param[in] NetworkItem The network item.
+ */
+VOID PhNetworkItemInvalidateHostname(
+    _In_ PPH_NETWORK_ITEM NetworkItem
+    )
+{
+    if (NetworkItem->LocalHostString)
+    {
+        PhDereferenceObject(NetworkItem->LocalHostString);
+        NetworkItem->LocalHostString = NULL;
+    }
+
+    if (NetworkItem->RemoteHostString)
+    {
+        PhDereferenceObject(NetworkItem->RemoteHostString);
+        NetworkItem->RemoteHostString = NULL;
+    }
+
+    NetworkItem->LocalHostnameResolved = FALSE;
+    NetworkItem->RemoteHostnameResolved = FALSE;
+
+    PhNetworkItemResolveHostname(NetworkItem);
+}
+
+/**
+ * Updates the owner of a network item.
+ *
+ * \param[in] NetworkItem The network item.
+ * \param[in] ServiceTag The service tag.
+ */
+VOID PhpUpdateNetworkItemOwner(
+    _In_ PPH_NETWORK_ITEM NetworkItem,
+    _In_ ULONGLONG ServiceTag
+    )
+{
+    if (ServiceTag)
+    {
+        PPH_STRING serviceName;
+
+        serviceName = PhGetServiceNameFromTag(NetworkItem->ProcessId, (PVOID)ServiceTag);
+
+        if (serviceName)
+            PhMoveReference(&NetworkItem->OwnerName, serviceName);
+    }
+}
+
+/**
+ * Flushes the network query data and updates network items.
+ */
+VOID PhFlushNetworkQueryData(
+    VOID
+    )
+{
+    PSLIST_ENTRY entry;
+    PPH_NETWORK_ITEM_QUERY_DATA data;
+
+    if (!FlagOn(PhNetworkProviderFlagsMask, PH_NETWORK_PROVIDER_FLAG_HOSTNAME))
+        return;
+    //if (!RtlFirstEntrySList(&PhNetworkItemQueryListHead))
+    //    return;
+
+    entry = RtlInterlockedFlushSList(&PhNetworkItemQueryListHead);
+
+    while (entry)
+    {
+        data = CONTAINING_RECORD(entry, PH_NETWORK_ITEM_QUERY_DATA, ListEntry);
+        entry = entry->Next;
+
+        if (data->Remote)
+        {
+            PhMoveReference(&data->NetworkItem->RemoteHostString, data->HostString);
+            data->NetworkItem->RemoteHostnameResolved = TRUE;
+        }
+        else
+        {
+            PhMoveReference(&data->NetworkItem->LocalHostString, data->HostString);
+            data->NetworkItem->LocalHostnameResolved = TRUE;
+        }
+
+        InterlockedExchange(&data->NetworkItem->JustResolved, TRUE);
+
+        PhDereferenceObject(data->NetworkItem);
+        PhFree(data);
+    }
+}
+
+/**
+ * Updates the network provider.
+ *
+ * \param[in] Object Reserved.
+ */
+_Function_class_(PH_PROVIDER_FUNCTION)
+VOID PhNetworkProviderUpdate(
+    _In_ PVOID Object
+    )
+{
+    static ULONG runCount = 0;
+    PH_PROVIDER_UPDATED_EVENT updatedEvent;
+    PPH_NETWORK_CONNECTION connections;
+    ULONG numberOfConnections;
+    ULONG i;
+
+    PhTraceFuncEnter("Network provider run count: %lu", runCount);
+
+    if (!NetworkImportDone)
+    {
+        PVOID iphlpapi;
+
+        if (iphlpapi = PhLoadLibrary(L"iphlpapi.dll"))
+        {
+            GetExtendedTcpTable_I = PhGetDllBaseProcedureAddress(iphlpapi, "GetExtendedTcpTable", 0);
+            GetExtendedUdpTable_I = PhGetDllBaseProcedureAddress(iphlpapi, "GetExtendedUdpTable", 0);
+            GetBoundTcpEndpointTable_I = PhGetDllBaseProcedureAddress(iphlpapi, "InternalGetBoundTcpEndpointTable", 0);
+            GetBoundTcp6EndpointTable_I = PhGetDllBaseProcedureAddress(iphlpapi, "InternalGetBoundTcp6EndpointTable", 0);
+        }
+
+        NetworkImportDone = TRUE;
+    }
+
+    if (!PhGetNetworkConnections(&connections, &numberOfConnections))
+    {
+        PhTraceFuncExit("Failed to get network connections: %lu", runCount);
+        return;
+    }
+
+    // Look for closed connections.
+    {
+        PPH_LIST connectionsToRemove = NULL;
+        ULONG j;
+        PPH_HASH_ENTRY entry;
+        PPH_NETWORK_ITEM networkItem;
+
+        PhAcquireQueuedLockShared(&PhNetworkHashSetLock);
+
+        for (i = 0; i < PH_HASH_SET_SIZE(PhNetworkHashSet); i++)
+        {
+            for (entry = PhNetworkHashSet[i]; entry; entry = entry->Next)
+            {
+                BOOLEAN found = FALSE;
+
+                networkItem = CONTAINING_RECORD(entry, PH_NETWORK_ITEM, HashEntry);
+
+                for (j = 0; j < numberOfConnections; j++)
+                {
+                    if (
+                        networkItem->ProtocolType == connections[j].ProtocolType &&
+                        PhEqualIpEndpoint(&networkItem->LocalEndpoint, &connections[j].LocalEndpoint) &&
+                        PhEqualIpEndpoint(&networkItem->RemoteEndpoint, &connections[j].RemoteEndpoint) &&
+                        networkItem->ProcessId == connections[j].ProcessId &&
+                        networkItem->CreateTime.QuadPart == connections[j].CreateTime.QuadPart
+                        )
+                    {
+                        found = TRUE;
+                        break;
+                    }
+                }
+
+                if (!found)
+                {
+                    if (!connectionsToRemove)
+                        connectionsToRemove = PhCreateList(2);
+
+                    PhAddItemList(connectionsToRemove, networkItem);
+                }
+            }
+        }
+
+        PhReleaseQueuedLockShared(&PhNetworkHashSetLock);
+
+        if (connectionsToRemove)
+        {
+            for (i = 0; i < connectionsToRemove->Count; i++)
+            {
+                PhInvokeCallback(PhGetGeneralCallback(GeneralCallbackNetworkProviderRemovedEvent), connectionsToRemove->Items[i]);
+            }
+
+            PhAcquireQueuedLockExclusive(&PhNetworkHashSetLock);
+
+            for (i = 0; i < connectionsToRemove->Count; i++)
+            {
+                PhpRemoveNetworkItem(connectionsToRemove->Items[i]);
+            }
+
+            PhReleaseQueuedLockExclusive(&PhNetworkHashSetLock);
+            PhDereferenceObject(connectionsToRemove);
+        }
+    }
+
+    // Go through the queued network item query data.
+    PhFlushNetworkQueryData();
+
+    // Look for new network connections and update existing ones.
+    for (i = 0; i < numberOfConnections; i++)
+    {
+        PPH_NETWORK_CONNECTION connection = &connections[i];
+        PPH_NETWORK_ITEM networkItem;
+
+        // Try to find the connection in our hash set.
+        networkItem = PhReferenceNetworkItem(
+            connection->ProtocolType,
+            &connection->LocalEndpoint,
+            &connection->RemoteEndpoint,
+            connection->ProcessId
+            );
+
+        if (!networkItem)
+        {
+            PPH_PROCESS_ITEM processItem;
+
+            // Network item not found, create it.
+
+            networkItem = PhCreateNetworkItem();
+
+            // Fill in basic information.
+            networkItem->ProtocolType = connection->ProtocolType;
+            networkItem->LocalEndpoint = connection->LocalEndpoint;
+            networkItem->RemoteEndpoint = connection->RemoteEndpoint;
+            networkItem->State = connection->State;
+            networkItem->ProcessId = connection->ProcessId;
+            networkItem->CreateTime = connection->CreateTime;
+            networkItem->LocalScopeId = connection->LocalScopeId;
+            networkItem->RemoteScopeId = connection->RemoteScopeId;
+            PhpUpdateNetworkItemOwner(networkItem, connection->OwnerInfo[0]);
+
+            // Format various strings.
+
+            switch (networkItem->LocalEndpoint.Address.Type)
+            {
+            case PH_NETWORK_TYPE_IPV4:
+                {
+                    WCHAR localAddressString[IP4_ADDRESS_STRING_LENGTH];
+                    ULONG localAddressStringLength = RTL_NUMBER_OF(localAddressString);
+
+                    if (NT_SUCCESS(RtlIpv4AddressToStringEx(
+                        &networkItem->LocalEndpoint.Address.InAddr,
+                        0,
+                        localAddressString,
+                        &localAddressStringLength
+                        )))
+                    {
+                        networkItem->LocalAddressString = PhCreateStringEx(
+                            localAddressString,
+                            (localAddressStringLength - 1) * sizeof(WCHAR)
+                            );
+                    }
+                }
+                break;
+            case PH_NETWORK_TYPE_IPV6:
+                {
+                    WCHAR localAddressString[IP6_ADDRESS_STRING_LENGTH];
+                    ULONG localAddressStringLength = RTL_NUMBER_OF(localAddressString);
+
+                    if (NT_SUCCESS(RtlIpv6AddressToStringEx(
+                        &networkItem->LocalEndpoint.Address.In6Addr,
+                        networkItem->LocalScopeId,
+                        0,
+                        localAddressString,
+                        &localAddressStringLength
+                        )))
+                    {
+                        networkItem->LocalAddressString = PhCreateStringEx(
+                            localAddressString,
+                            (localAddressStringLength - 1) * sizeof(WCHAR)
+                            );
+                    }
+                }
+                break;
+            case PH_NETWORK_TYPE_HYPERV:
+                {
+                    networkItem->LocalAddressString = PhHvSocketAddressString(
+                        &networkItem->LocalEndpoint.Address.HvAddr
+                        );
+                    networkItem->HvService = PhHvSocketGetServiceName(
+                        &networkItem->LocalEndpoint.Address.HvAddr
+                        );
+                }
+                break;
+            }
+
+            switch (networkItem->RemoteEndpoint.Address.Type)
+            {
+            case PH_NETWORK_TYPE_IPV4:
+                {
+                    if (!PhIsNullIpAddress(&networkItem->RemoteEndpoint.Address))
+                    {
+                        WCHAR remoteAddressString[IP4_ADDRESS_STRING_LENGTH];
+                        ULONG remoteAddressStringLength = RTL_NUMBER_OF(remoteAddressString);
+
+                        if (NT_SUCCESS(RtlIpv4AddressToStringEx(
+                            &networkItem->RemoteEndpoint.Address.InAddr,
+                            0,
+                            remoteAddressString,
+                            &remoteAddressStringLength
+                            )))
+                        {
+                            networkItem->RemoteAddressString = PhCreateStringEx(
+                                remoteAddressString,
+                                (remoteAddressStringLength - 1) * sizeof(WCHAR)
+                                );
+                        }
+                    }
+                }
+                break;
+            case PH_NETWORK_TYPE_IPV6:
+                {
+                    if (!PhIsNullIpAddress(&networkItem->RemoteEndpoint.Address))
+                    {
+                        WCHAR remoteAddressString[IP6_ADDRESS_STRING_LENGTH];
+                        ULONG remoteAddressStringLength = RTL_NUMBER_OF(remoteAddressString);
+
+                        if (NT_SUCCESS(RtlIpv6AddressToStringEx(
+                            &networkItem->RemoteEndpoint.Address.In6Addr,
+                            networkItem->RemoteScopeId,
+                            0,
+                            remoteAddressString,
+                            &remoteAddressStringLength
+                            )))
+                        {
+                            networkItem->RemoteAddressString = PhCreateStringEx(
+                                remoteAddressString,
+                                (remoteAddressStringLength - 1) * sizeof(WCHAR)
+                                );
+                        }
+                    }
+                }
+                break;
+            case PH_NETWORK_TYPE_HYPERV:
+                {
+                    networkItem->RemoteAddressString = PhHvSocketAddressString(
+                        &networkItem->RemoteEndpoint.Address.HvAddr
+                        );
+                }
+                break;
+            }
+
+            if (networkItem->LocalEndpoint.Port != 0)
+                PhPrintUInt32(networkItem->LocalPortString, networkItem->LocalEndpoint.Port);
+            if (networkItem->RemoteEndpoint.Port != 0)
+                PhPrintUInt32(networkItem->RemotePortString, networkItem->RemoteEndpoint.Port);
+
+            // Get host names.
+            PhNetworkItemResolveHostname(networkItem);
+
+            // Get process information.
+            if (processItem = PhReferenceProcessItem(networkItem->ProcessId))
+            {
+                networkItem->ProcessItem = processItem;
+                PhSetReference(&networkItem->ProcessName, processItem->ProcessName);
+                networkItem->SubsystemProcess = !!processItem->IsSubsystemProcess;
+
+                if (PhTestEvent(&processItem->Stage1Event))
+                {
+                    networkItem->ProcessIconIndex = processItem->SmallIconIndex;
+                    networkItem->ProcessIconValid = TRUE;
+                }
+
+                // NOTE: We dereference processItem in PhpNetworkItemDeleteProcedure. (dmex)
+            }
+            else
+            {
+                HANDLE processHandle;
+                PPH_STRING fileName;
+                PROCESS_EXTENDED_BASIC_INFORMATION basicInfo;
+
+                // HACK HACK HACK
+                // WSL subsystem processes (e.g. apache/nginx) create sockets, clone/fork themselves, duplicate the socket into the child process and then terminate.
+                // The socket handle remains valid and in-use by the child process BUT the socket continues returning the PID of the exited process???
+                // Fixing this causes a major performance problem; If we have 100,000 sockets then on previous versions of Windows we would only need 2 system calls maximum
+                // (for the process list) to identify the owner of every socket but now we need to make 4 system calls for every_last_socket totaling 400,000 system calls... great. (dmex)
+                if (NT_SUCCESS(PhOpenProcess(&processHandle, PROCESS_QUERY_LIMITED_INFORMATION, networkItem->ProcessId)))
+                {
+                    if (NT_SUCCESS(PhGetProcessExtendedBasicInformation(processHandle, &basicInfo)))
+                    {
+                        networkItem->SubsystemProcess = !!basicInfo.IsSubsystemProcess;
+                    }
+
+                    if (NT_SUCCESS(PhGetProcessImageFileName(processHandle, &fileName)))
+                    {
+                        PhMoveReference(&networkItem->ProcessName, PhGetBaseName(fileName));
+                    }
+
+                    NtClose(processHandle);
+                }
+
+                networkItem->UnknownProcess = TRUE;
+            }
+
+            // Add the network item to the hash set.
+            PhAcquireQueuedLockExclusive(&PhNetworkHashSetLock);
+            PhAddEntryHashSet(
+                PhNetworkHashSet,
+                PH_HASH_SET_SIZE(PhNetworkHashSet),
+                &networkItem->HashEntry,
+                PhHashNetworkItem(networkItem)
+                );
+            PhNetworkHashSetCount++;
+            PhReleaseQueuedLockExclusive(&PhNetworkHashSetLock);
+
+            // Raise the network item added event.
+            PhInvokeCallback(PhGetGeneralCallback(GeneralCallbackNetworkProviderAddedEvent), networkItem);
+        }
+        else
+        {
+            BOOLEAN modified = FALSE;
+
+            if (InterlockedExchange(&networkItem->JustResolved, 0) != 0)
+                modified = TRUE;
+
+            if (networkItem->State != connection->State)
+            {
+                networkItem->State = connection->State;
+                modified = TRUE;
+            }
+
+            if (!networkItem->ProcessItem)
+            {
+                networkItem->ProcessItem = PhReferenceProcessItem(networkItem->ProcessId);
+                // NOTE: We dereference processItem in PhpNetworkItemDeleteProcedure. (dmex)
+            }
+
+            if (networkItem->ProcessItem)
+            {
+                if (PhIsNullOrEmptyString(networkItem->ProcessName))
+                {
+                    PhSetReference(&networkItem->ProcessName, networkItem->ProcessItem->ProcessName);
+                    modified = TRUE;
+                }
+
+                if (!networkItem->ProcessIconValid && PhTestEvent(&networkItem->ProcessItem->Stage1Event))
+                {
+                    networkItem->ProcessIconIndex = networkItem->ProcessItem->SmallIconIndex;
+                    networkItem->ProcessIconValid = TRUE;
+                    modified = TRUE;
+                }
+            }
+
+            if (networkItem->InvalidateHostname)
+            {
+                networkItem->InvalidateHostname = FALSE;
+
+                PhNetworkItemInvalidateHostname(networkItem);
+
+                modified = TRUE;
+            }
+
+            if (modified)
+            {
+                // Raise the network item modified event.
+                PhInvokeCallback(PhGetGeneralCallback(GeneralCallbackNetworkProviderModifiedEvent), networkItem);
+            }
+
+            PhDereferenceObject(networkItem);
+        }
+    }
+
+    PhFree(connections);
+
+    updatedEvent.RunCount = runCount;
+    updatedEvent.UpdateInterval = PhCsUpdateInterval;
+
+    PhInvokeCallback(PhGetGeneralCallback(GeneralCallbackNetworkProviderUpdatedEvent), &updatedEvent);
+
+    dprintf("Network provider run count: %lu\n", runCount);
+
+    runCount++;
+}
+
+#ifdef _WIN64
+/**
+ * Gets Hyper-V socket listeners for a specific VM.
+ *
+ * \param[in] SystemHandle The system handle.
+ * \param[in] VmId The VM ID.
+ * \return A pointer to the listeners, or NULL if unsuccessful.
+ */
+PHVSOCKET_LISTENERS PhpGetHvSocketListeners(
+    _In_ HANDLE SystemHandle,
+    _In_ const GUID* VmId
+    )
+{
+    NTSTATUS status;
+    ULONG length;
+    PHVSOCKET_LISTENERS listeners;
+
+    length = PAGE_SIZE;
+    listeners = PhAllocate(length);
+
+    for (;;)
+    {
+        status = PhHvSocketGetListeners(SystemHandle, VmId, listeners, length, &length);
+        if (status != STATUS_BUFFER_TOO_SMALL)
+        {
+            break;
+        }
+
+        length *= 2;
+        listeners = PhReAllocate(listeners, length);
+    }
+
+    if (!NT_SUCCESS(status))
+    {
+        PhFree(listeners);
+        listeners = NULL;
+    }
+
+    return listeners;
+}
+
+/**
+ * Gets Hyper-V socket connections for a specific VM.
+ *
+ * \param[in] SystemHandle The system handle.
+ * \param[in] VmId The VM ID.
+ * \return A pointer to the connections, or NULL if unsuccessful.
+ */
+PHVSOCKET_CONNECTIONS PhpGetHvSocketConnections(
+    _In_ HANDLE SystemHandle,
+    _In_ const GUID* VmId
+    )
+{
+    NTSTATUS status;
+    ULONG length;
+    PHVSOCKET_CONNECTIONS connections;
+
+    length = PAGE_SIZE;
+    connections = PhAllocate(length);
+
+    for (;;)
+    {
+        status = PhHvSocketGetConnections(SystemHandle, VmId, connections, length, &length);
+        if (status != STATUS_BUFFER_TOO_SMALL || length == 0)
+        {
+            break;
+        }
+
+        length *= 2;
+        connections = PhReAllocate(connections, length);
+    }
+
+    if (!NT_SUCCESS(status))
+    {
+        PhFree(connections);
+        connections = NULL;
+    }
+
+    return connections;
+}
+
+/**
+ * Collects Hyper-V socket listeners and connections for a set of VMs.
+ *
+ * \param[in] VmIds An array of VM IDs.
+ * \param[in] Count The number of VM IDs.
+ * \param[out] Listeners A variable which receives the collected listeners.
+ * \param[out] Connections A variable which receives the collected connections.
+ */
+VOID PhpCollectHvSocket(
+    _In_ PGUID VmIds,
+    _In_ SIZE_T Count,
+    _Out_ PHVSOCKET_LISTENERS* Listeners,
+    _Out_ PHVSOCKET_CONNECTIONS* Connections
+    )
+{
+    HANDLE systemHandle;
+    PHVSOCKET_LISTENERS listeners;
+    PHVSOCKET_CONNECTIONS connections;
+    ULONG listenersCount;
+    ULONG connectionsCount;
+    PPH_LIST listenersList;
+    PPH_LIST connectionsList;
+
+    if (!NT_SUCCESS(PhHvSocketOpenSystemControl(&systemHandle, NULL)))
+    {
+        *Listeners = NULL;
+        *Connections = NULL;
+        return;
+    }
+
+    listenersCount = 0;
+    connectionsCount = 0;
+    listenersList = PhCreateList(1);
+    connectionsList = PhCreateList(1);
+
+    for (ULONG i = 0; i < Count; i++)
+    {
+        if (listeners = PhpGetHvSocketListeners(systemHandle, &VmIds[i]))
+        {
+            PhAddItemList(listenersList, listeners);
+            listenersCount += listeners->Count;
+        }
+
+        if (connections = PhpGetHvSocketConnections(systemHandle, &VmIds[i]))
+        {
+            PhAddItemList(connectionsList, connections);
+            connectionsCount += connections->Count;
+        }
+    }
+
+    listeners = NULL;
+    connections = NULL;
+
+    if (listenersCount)
+    {
+        listeners = PhAllocate(
+            RTL_SIZEOF_THROUGH_FIELD(HVSOCKET_LISTENERS, Listener) +
+            (sizeof(HVSOCKET_LISTENER) * listenersCount)
+            );
+        listeners->Count = 0;
+    }
+
+    for (ULONG i = 0; i < listenersList->Count; i++)
+    {
+        PHVSOCKET_LISTENERS l;
+
+        l = listenersList->Items[i];
+
+        if (listeners)
+        {
+            RtlCopyMemory(
+                &listeners->Listener[listeners->Count],
+                l->Listener,
+                sizeof(HVSOCKET_LISTENER) * l->Count
+                );
+
+            listeners->Count += l->Count;
+        }
+
+        PhFree(l);
+    }
+
+    if (connectionsCount)
+    {
+        connections = PhAllocate(
+            RTL_SIZEOF_THROUGH_FIELD(HVSOCKET_CONNECTIONS, Connection) +
+            (sizeof(HVSOCKET_CONNECTION) * connectionsCount)
+            );
+        connections->Count = 0;
+    }
+
+    for (ULONG i = 0; i < connectionsList->Count; i++)
+    {
+        PHVSOCKET_CONNECTIONS c;
+
+        c = connectionsList->Items[i];
+
+        if (connections)
+        {
+            RtlCopyMemory(
+                &connections->Connection[connections->Count],
+                c->Connection,
+                sizeof(HVSOCKET_CONNECTION) * c->Count
+                );
+
+            connections->Count += c->Count;
+        }
+
+        PhFree(c);
+    }
+
+    PhDereferenceObject(listenersList);
+    PhDereferenceObject(connectionsList);
+
+    *Listeners = listeners;
+    *Connections = connections;
+
+    NtClose(systemHandle);
+}
+
+/**
+ * Callback function for enumerating Hyper-V compute systems.
+ *
+ * \param[in] RootDirectory The root directory.
+ * \param[in] Information Information about the key.
+ * \param[in] Context A pointer to a GUID array.
+ * \return TRUE to continue enumeration, FALSE otherwise.
+ */
+_Function_class_(PH_ENUM_KEY_CALLBACK)
+static BOOLEAN NTAPI PhpHvEnumComputeSystemCallback(
+    _In_ HANDLE RootDirectory,
+    _In_ PVOID Information,
+    _In_ PVOID Context
+    )
+{
+    PKEY_BASIC_INFORMATION basicInfo = (PKEY_BASIC_INFORMATION)Information;
+    PPH_ARRAY guidArray = Context;
+    PH_STRINGREF name;
+    PH_FORMAT format[3];
+    PPH_STRING string;
+    GUID guid;
+
+    name.Buffer = basicInfo->Name;
+    name.Length = basicInfo->NameLength;
+
+    PhInitFormatC(&format[0], L'{');
+    PhInitFormatSR(&format[1], name);
+    PhInitFormatC(&format[2], L'}');
+
+    string = PhFormat(format, 3, 10);
+
+    if (NT_SUCCESS(PhStringToGuid(&string->sr, &guid)))
+        PhAddItemArray(guidArray, &guid);
+
+    PhDereferenceObject(string);
+
+    return TRUE;
+}
+
+/**
+ * Gets Hyper-V socket listeners and connections.
+ *
+ * \param[out] Listeners A variable which receives the listeners.
+ * \param[out] Connections A variable which receives the connections.
+ */
+VOID PhpGetHvSocket(
+    _Out_ PHVSOCKET_LISTENERS* Listeners,
+    _Out_ PHVSOCKET_CONNECTIONS* Connections
+)
+{
+    static const PH_STRINGREF hvComputeSystemKey = PH_STRINGREF_INIT(L"Software\\Microsoft\\Windows NT\\CurrentVersion\\HostComputeService\\VolatileStore\\ComputeSystem");
+    PH_ARRAY guidArray;
+    HANDLE keyHandle;
+
+    PhInitializeArray(&guidArray, sizeof(GUID), 10);
+    PhAddItemArray(&guidArray, (PVOID)&HV_GUID_WILDCARD);
+    PhAddItemArray(&guidArray, (PVOID)&HV_GUID_BROADCAST);
+    PhAddItemArray(&guidArray, (PVOID)&HV_GUID_CHILDREN);
+    PhAddItemArray(&guidArray, (PVOID)&HV_GUID_LOOPBACK);
+    PhAddItemArray(&guidArray, (PVOID)&HV_GUID_PARENT);
+    PhAddItemArray(&guidArray, (PVOID)&HV_GUID_SILOHOST);
+
+    if (NT_SUCCESS(PhOpenKey(
+        &keyHandle,
+        KEY_ENUMERATE_SUB_KEYS,
+        PH_KEY_LOCAL_MACHINE,
+        &hvComputeSystemKey,
+        0
+        )))
+    {
+        PhEnumerateKey(keyHandle, KeyBasicInformation, PhpHvEnumComputeSystemCallback, &guidArray);
+        NtClose(keyHandle);
+    }
+
+    PhpCollectHvSocket(
+        PhFinalArrayItems(&guidArray),
+        PhFinalArrayCount(&guidArray),
+        Listeners,
+        Connections
+        );
+
+    PhDeleteArray(&guidArray);
+}
+#endif // _WIN64
+
+/**
+ * Gets the current network connections.
+ *
+ * \param[out] Connections A variable which receives an array of network connections. You must
+ * free the buffer with PhFree() when you no longer need it.
+ * \param[out] NumberOfConnections A variable which receives the number of network connections.
+ * \return TRUE if successful, FALSE otherwise.
+ */
+_Success_(return)
+BOOLEAN PhGetNetworkConnections(
+    _Out_ PPH_NETWORK_CONNECTION *Connections,
+    _Out_ PULONG NumberOfConnections
+    )
+{
+    PVOID table;
+    ULONG tableSize;
+    PMIB_TCPTABLE_OWNER_MODULE tcp4Table;
+    PMIB_TCP6TABLE_OWNER_MODULE tcp6Table;
+    PMIB_UDPTABLE_OWNER_MODULE udp4Table;
+    PMIB_UDP6TABLE_OWNER_MODULE udp6Table;
+    PMIB_TCPTABLE2 boundTcpTable;
+    PMIB_TCP6TABLE2 boundTcp6Table;
+#ifdef _WIN64
+    PHVSOCKET_LISTENERS hvListeners;
+    PHVSOCKET_CONNECTIONS hvConnections;
+#endif
+    ULONG i;
+    ULONG count = 0;
+    ULONG index = 0;
+    PPH_NETWORK_CONNECTION connections;
+
+    // TCP IPv4
+
+    tableSize = 0;
+    GetExtendedTcpTable_I(NULL, &tableSize, FALSE, AF_INET, TCP_TABLE_OWNER_MODULE_ALL, 0);
+    table = PhAllocate(tableSize);
+
+    if (GetExtendedTcpTable_I(table, &tableSize, FALSE, AF_INET, TCP_TABLE_OWNER_MODULE_ALL, 0) == NO_ERROR)
+    {
+        tcp4Table = table;
+        count += tcp4Table->dwNumEntries;
+    }
+    else
+    {
+        PhFree(table);
+        tcp4Table = NULL;
+    }
+
+    // TCP IPv6
+
+    tableSize = 0;
+    GetExtendedTcpTable_I(NULL, &tableSize, FALSE, AF_INET6, TCP_TABLE_OWNER_MODULE_ALL, 0);
+    table = PhAllocate(tableSize);
+
+    if (GetExtendedTcpTable_I(table, &tableSize, FALSE, AF_INET6, TCP_TABLE_OWNER_MODULE_ALL, 0) == NO_ERROR)
+    {
+        tcp6Table = table;
+        count += tcp6Table->dwNumEntries;
+    }
+    else
+    {
+        PhFree(table);
+        tcp6Table = NULL;
+    }
+
+    // UDP IPv4
+
+    tableSize = 0;
+    GetExtendedUdpTable_I(NULL, &tableSize, FALSE, AF_INET, UDP_TABLE_OWNER_MODULE, 0);
+    table = PhAllocate(tableSize);
+
+    if (GetExtendedUdpTable_I(table, &tableSize, FALSE, AF_INET, UDP_TABLE_OWNER_MODULE, 0) == NO_ERROR)
+    {
+        udp4Table = table;
+        count += udp4Table->dwNumEntries;
+    }
+    else
+    {
+        PhFree(table);
+        udp4Table = NULL;
+    }
+
+    // UDP IPv6
+
+    tableSize = 0;
+    GetExtendedUdpTable_I(NULL, &tableSize, FALSE, AF_INET6, UDP_TABLE_OWNER_MODULE, 0);
+    table = PhAllocate(tableSize);
+
+    if (GetExtendedUdpTable_I(table, &tableSize, FALSE, AF_INET6, UDP_TABLE_OWNER_MODULE, 0) == NO_ERROR)
+    {
+        udp6Table = table;
+        count += udp6Table->dwNumEntries;
+    }
+    else
+    {
+        PhFree(table);
+        udp6Table = NULL;
+    }
+
+#ifdef _WIN64
+    // Hyper-V
+    PhpGetHvSocket(&hvListeners, &hvConnections);
+    if (hvListeners)
+    {
+        count += hvListeners->Count;
+    }
+    if (hvConnections)
+    {
+        count += hvConnections->Count;
+    }
+#endif
+
+    if (PhEnableNetworkBoundConnections && WindowsVersion >= WINDOWS_10_RS5 && GetBoundTcpEndpointTable_I && GetBoundTcp6EndpointTable_I)
+    {
+        // Bound TCP IPv4
+
+        if (GetBoundTcpEndpointTable_I(&table, PhHeapHandle, 0) == NO_ERROR)
+        {
+            boundTcpTable = table;
+            count += boundTcpTable->dwNumEntries;
+        }
+        else
+        {
+            boundTcpTable = NULL;
+        }
+
+        // Bound TCP IPv6
+
+        if (GetBoundTcp6EndpointTable_I(&table, PhHeapHandle, 0) == NO_ERROR)
+        {
+            boundTcp6Table = table;
+            count += boundTcp6Table->dwNumEntries;
+        }
+        else
+        {
+            boundTcp6Table = NULL;
+        }
+    }
+    else
+    {
+        boundTcpTable = NULL;
+        boundTcp6Table = NULL;
+    }
+
+    connections = PhAllocate(sizeof(PH_NETWORK_CONNECTION) * count);
+    memset(connections, 0, sizeof(PH_NETWORK_CONNECTION) * count);
+
+    if (tcp4Table)
+    {
+        for (i = 0; i < tcp4Table->dwNumEntries; i++)
+        {
+            connections[index].ProtocolType = PH_NETWORK_PROTOCOL_TCP4;
+
+            connections[index].LocalEndpoint.Address.Type = PH_NETWORK_TYPE_IPV4;
+            memcpy(connections[index].LocalEndpoint.Address.Ipv4, &tcp4Table->table[i].dwLocalAddr, sizeof(IN_ADDR));
+            connections[index].LocalEndpoint.Port = _byteswap_ushort((USHORT)tcp4Table->table[i].dwLocalPort);
+
+            connections[index].RemoteEndpoint.Address.Type = PH_NETWORK_TYPE_IPV4;
+            memcpy(connections[index].RemoteEndpoint.Address.Ipv4, &tcp4Table->table[i].dwRemoteAddr, sizeof(IN_ADDR));
+            connections[index].RemoteEndpoint.Port = _byteswap_ushort((USHORT)tcp4Table->table[i].dwRemotePort);
+
+            connections[index].State = tcp4Table->table[i].dwState;
+            connections[index].ProcessId = UlongToHandle(tcp4Table->table[i].dwOwningPid);
+            connections[index].CreateTime = tcp4Table->table[i].liCreateTimestamp;
+            memcpy(
+                connections[index].OwnerInfo,
+                tcp4Table->table[i].OwningModuleInfo,
+                sizeof(ULONGLONG) * min(PH_NETWORK_OWNER_INFO_SIZE, TCPIP_OWNING_MODULE_SIZE)
+                );
+
+            index++;
+        }
+
+        PhFree(tcp4Table);
+    }
+
+    if (tcp6Table)
+    {
+        for (i = 0; i < tcp6Table->dwNumEntries; i++)
+        {
+            connections[index].ProtocolType = PH_NETWORK_PROTOCOL_TCP6;
+
+            connections[index].LocalEndpoint.Address.Type = PH_NETWORK_TYPE_IPV6;
+            memcpy(connections[index].LocalEndpoint.Address.Ipv6, tcp6Table->table[i].ucLocalAddr, 16);
+            connections[index].LocalEndpoint.Port = _byteswap_ushort((USHORT)tcp6Table->table[i].dwLocalPort);
+
+            connections[index].RemoteEndpoint.Address.Type = PH_NETWORK_TYPE_IPV6;
+            memcpy(connections[index].RemoteEndpoint.Address.Ipv6, tcp6Table->table[i].ucRemoteAddr, 16);
+            connections[index].RemoteEndpoint.Port = _byteswap_ushort((USHORT)tcp6Table->table[i].dwRemotePort);
+
+            connections[index].State = tcp6Table->table[i].dwState;
+            connections[index].ProcessId = UlongToHandle(tcp6Table->table[i].dwOwningPid);
+            connections[index].CreateTime = tcp6Table->table[i].liCreateTimestamp;
+            memcpy(
+                connections[index].OwnerInfo,
+                tcp6Table->table[i].OwningModuleInfo,
+                sizeof(ULONGLONG) * min(PH_NETWORK_OWNER_INFO_SIZE, TCPIP_OWNING_MODULE_SIZE)
+                );
+
+            connections[index].LocalScopeId = tcp6Table->table[i].dwLocalScopeId;
+            connections[index].RemoteScopeId = tcp6Table->table[i].dwRemoteScopeId;
+
+            index++;
+        }
+
+        PhFree(tcp6Table);
+    }
+
+    if (udp4Table)
+    {
+        for (i = 0; i < udp4Table->dwNumEntries; i++)
+        {
+            connections[index].ProtocolType = PH_NETWORK_PROTOCOL_UDP4;
+
+            connections[index].LocalEndpoint.Address.Type = PH_NETWORK_TYPE_IPV4;
+            memcpy(connections[index].LocalEndpoint.Address.Ipv4, &udp4Table->table[i].dwLocalAddr, sizeof(IN_ADDR));
+            connections[index].LocalEndpoint.Port = _byteswap_ushort((USHORT)udp4Table->table[i].dwLocalPort);
+
+            connections[index].RemoteEndpoint.Address.Type = 0;
+
+            connections[index].State = 0;
+            connections[index].ProcessId = UlongToHandle(udp4Table->table[i].dwOwningPid);
+            connections[index].CreateTime = udp4Table->table[i].liCreateTimestamp;
+            memcpy(
+                connections[index].OwnerInfo,
+                udp4Table->table[i].OwningModuleInfo,
+                sizeof(ULONGLONG) * min(PH_NETWORK_OWNER_INFO_SIZE, TCPIP_OWNING_MODULE_SIZE)
+                );
+
+            index++;
+        }
+
+        PhFree(udp4Table);
+    }
+
+    if (udp6Table)
+    {
+        for (i = 0; i < udp6Table->dwNumEntries; i++)
+        {
+            connections[index].ProtocolType = PH_NETWORK_PROTOCOL_UDP6;
+
+            connections[index].LocalEndpoint.Address.Type = PH_NETWORK_TYPE_IPV6;
+            memcpy(connections[index].LocalEndpoint.Address.Ipv6, udp6Table->table[i].ucLocalAddr, sizeof(IN6_ADDR));
+            connections[index].LocalEndpoint.Port = _byteswap_ushort((USHORT)udp6Table->table[i].dwLocalPort);
+
+            connections[index].RemoteEndpoint.Address.Type = 0;
+
+            connections[index].State = 0;
+            connections[index].ProcessId = UlongToHandle(udp6Table->table[i].dwOwningPid);
+            connections[index].CreateTime = udp6Table->table[i].liCreateTimestamp;
+            memcpy(
+                connections[index].OwnerInfo,
+                udp6Table->table[i].OwningModuleInfo,
+                sizeof(ULONGLONG) * min(PH_NETWORK_OWNER_INFO_SIZE, TCPIP_OWNING_MODULE_SIZE)
+                );
+
+            connections[index].LocalScopeId = udp6Table->table[i].dwLocalScopeId;
+            connections[index].RemoteScopeId = 0;
+
+            index++;
+        }
+
+        PhFree(udp6Table);
+    }
+
+    if (PhEnableNetworkBoundConnections && WindowsVersion >= WINDOWS_10_RS5)
+    {
+        if (boundTcpTable)
+        {
+            for (i = 0; i < boundTcpTable->dwNumEntries; i++)
+            {
+                connections[index].ProtocolType = PH_NETWORK_PROTOCOL_TCP4;
+
+                connections[index].LocalEndpoint.Address.Type = PH_NETWORK_TYPE_IPV4;
+                memcpy(connections[index].LocalEndpoint.Address.Ipv4, &boundTcpTable->table[i].dwLocalAddr, sizeof(IN_ADDR));
+                connections[index].LocalEndpoint.Port = _byteswap_ushort((USHORT)boundTcpTable->table[i].dwLocalPort);
+
+                connections[index].RemoteEndpoint.Address.Type = PH_NETWORK_TYPE_IPV4;
+                memcpy(connections[index].RemoteEndpoint.Address.Ipv4, &boundTcpTable->table[i].dwRemoteAddr, sizeof(IN_ADDR));
+                connections[index].RemoteEndpoint.Port = _byteswap_ushort((USHORT)boundTcpTable->table[i].dwRemotePort);
+
+                connections[index].State = boundTcpTable->table[i].dwState;
+                connections[index].ProcessId = UlongToHandle(boundTcpTable->table[i].dwOwningPid);
+
+                index++;
+            }
+
+            RtlFreeHeap(PhHeapHandle, 0, boundTcpTable);
+        }
+
+        if (boundTcp6Table)
+        {
+            for (i = 0; i < boundTcp6Table->dwNumEntries; i++)
+            {
+                connections[index].ProtocolType = PH_NETWORK_PROTOCOL_TCP6;
+
+                connections[index].LocalEndpoint.Address.Type = PH_NETWORK_TYPE_IPV6;
+                memcpy(connections[index].LocalEndpoint.Address.Ipv6, boundTcp6Table->table[i].LocalAddr.s6_addr, sizeof(IN6_ADDR));
+                connections[index].LocalEndpoint.Port = _byteswap_ushort((USHORT)boundTcp6Table->table[i].dwLocalPort);
+
+                connections[index].RemoteEndpoint.Address.Type = PH_NETWORK_TYPE_IPV6;
+                memcpy(connections[index].RemoteEndpoint.Address.Ipv6, boundTcp6Table->table[i].RemoteAddr.s6_addr, sizeof(IN6_ADDR));
+                connections[index].RemoteEndpoint.Port = _byteswap_ushort((USHORT)boundTcp6Table->table[i].dwRemotePort);
+
+                connections[index].State = boundTcp6Table->table[i].State;
+                connections[index].ProcessId = UlongToHandle(boundTcp6Table->table[i].dwOwningPid);
+
+                connections[index].LocalScopeId = boundTcp6Table->table[i].dwLocalScopeId;
+                connections[index].RemoteScopeId = boundTcp6Table->table[i].dwRemoteScopeId;
+
+                index++;
+            }
+
+            RtlFreeHeap(PhHeapHandle, 0, boundTcp6Table);
+        }
+    }
+
+#ifdef _WIN64
+    if (hvListeners)
+    {
+        for (i = 0; i < hvListeners->Count; i++)
+        {
+            connections[index].ProtocolType = PH_NETWORK_PROTOCOL_HYPERV;
+
+            connections[index].LocalEndpoint.Address.Type = PH_NETWORK_TYPE_HYPERV;
+            connections[index].LocalEndpoint.Address.HvAddr = hvListeners->Listener[i].ServiceId;
+
+            if (PhHvSocketIsVSockTemplate(&connections[index].LocalEndpoint.Address.HvAddr))
+                connections[index].LocalEndpoint.Port = hvListeners->Listener[i].Port;
+            else
+                connections[index].LocalEndpoint.Port = 0;
+
+            connections[index].RemoteEndpoint.Address.Type = PH_NETWORK_TYPE_HYPERV;
+            connections[index].RemoteEndpoint.Address.HvAddr = hvListeners->Listener[i].VmId;
+
+            connections[index].ProcessId = UlongToHandle(hvListeners->Listener[i].ProcessId);
+            connections[index].CreateTime = hvListeners->Listener[i].TimeStamp;
+
+            connections[index].State = 0; // HACK
+
+            index++;
+        }
+
+        PhFree(hvListeners);
+    }
+
+    if (hvConnections)
+    {
+        for (i = 0; i < hvConnections->Count; i++)
+        {
+            connections[index].ProtocolType = PH_NETWORK_PROTOCOL_HYPERV;
+
+            connections[index].LocalEndpoint.Address.Type = PH_NETWORK_TYPE_HYPERV;
+            connections[index].LocalEndpoint.Address.HvAddr = hvConnections->Connection[i].ServiceId;
+
+            if (PhHvSocketIsVSockTemplate(&connections[index].LocalEndpoint.Address.HvAddr))
+                connections[index].LocalEndpoint.Port = hvConnections->Connection[i].Port;
+            else
+                connections[index].LocalEndpoint.Port = 0;
+
+            connections[index].RemoteEndpoint.Address.Type = PH_NETWORK_TYPE_HYPERV;
+            connections[index].RemoteEndpoint.Address.HvAddr = hvConnections->Connection[i].VmId;
+
+            connections[index].ProcessId = UlongToHandle(hvConnections->Connection[i].ProcessId);
+            connections[index].CreateTime = hvConnections->Connection[i].TimeStamp;
+
+            connections[index].State = 1; // HACK
+
+            index++;
+        }
+
+        PhFree(hvConnections);
+    }
+#endif
+
+    *NumberOfConnections = count;
+    *Connections = connections;
+
+    return TRUE;
+}
+
+static CONST PH_KEY_VALUE_PAIR PhProtocolTypeStrings[] =
+{
+    SIP(SREF(L"Unknown"), 0),
+    SIP(SREF(L"TCP"), PH_NETWORK_PROTOCOL_TCP4),
+    SIP(SREF(L"TCP6"), PH_NETWORK_PROTOCOL_TCP6),
+    SIP(SREF(L"UDP"), PH_NETWORK_PROTOCOL_UDP4),
+    SIP(SREF(L"UDP6"), PH_NETWORK_PROTOCOL_UDP6),
+    SIP(SREF(L"HYPERV"), PH_NETWORK_PROTOCOL_HYPERV),
+};
+
+static CONST PH_KEY_VALUE_PAIR PhTcpStateStrings[] =
+{
+    SIP(SREF(L"Unknown"), 0),
+    SIP(SREF(L"Closed"), MIB_TCP_STATE_CLOSED),
+    SIP(SREF(L"Listen"), MIB_TCP_STATE_LISTEN),
+    SIP(SREF(L"SYN sent"), MIB_TCP_STATE_SYN_SENT),
+    SIP(SREF(L"SYN received"), MIB_TCP_STATE_SYN_RCVD),
+    SIP(SREF(L"Established"), MIB_TCP_STATE_ESTAB),
+    SIP(SREF(L"FIN wait 1"), MIB_TCP_STATE_FIN_WAIT1),
+    SIP(SREF(L"FIN wait 2"), MIB_TCP_STATE_FIN_WAIT2),
+    SIP(SREF(L"Close wait"), MIB_TCP_STATE_CLOSE_WAIT),
+    SIP(SREF(L"Closing"), MIB_TCP_STATE_CLOSING),
+    SIP(SREF(L"Last ACK"), MIB_TCP_STATE_LAST_ACK),
+    SIP(SREF(L"Time wait"), MIB_TCP_STATE_TIME_WAIT),
+    SIP(SREF(L"Delete TCB"), MIB_TCP_STATE_DELETE_TCB),
+    SIP(SREF(L"Bound"), MIB_TCP_STATE_RESERVED),
+};
+
+/**
+ * Gets the name of a protocol type.
+ *
+ * \param[in] ProtocolType The protocol type.
+ * \return A pointer to the protocol type name string.
+ */
+PCPH_STRINGREF PhGetProtocolTypeName(
+    _In_ ULONG ProtocolType
+    )
+{
+    PCPH_STRINGREF string;
+
+    if (PhFindStringRefSiKeyValuePairs(
+        PhProtocolTypeStrings,
+        sizeof(PhProtocolTypeStrings),
+        ProtocolType,
+        &string
+        ))
+    {
+        return string;
+    }
+
+    return PhProtocolTypeStrings[0].Key;
+}
+
+/**
+ * Gets the name of a TCP state.
+ *
+ * \param[in] State The TCP state.
+ * \return A pointer to the TCP state name string.
+ */
+PCPH_STRINGREF PhGetTcpStateName(
+    _In_ ULONG State
+    )
+{
+    switch (State)
+    {
+    case MIB_TCP_STATE_CLOSED:
+    case MIB_TCP_STATE_LISTEN:
+    case MIB_TCP_STATE_SYN_SENT:
+    case MIB_TCP_STATE_SYN_RCVD:
+    case MIB_TCP_STATE_ESTAB:
+    case MIB_TCP_STATE_FIN_WAIT1:
+    case MIB_TCP_STATE_FIN_WAIT2:
+    case MIB_TCP_STATE_CLOSE_WAIT:
+    case MIB_TCP_STATE_CLOSING:
+    case MIB_TCP_STATE_LAST_ACK:
+    case MIB_TCP_STATE_TIME_WAIT:
+    case MIB_TCP_STATE_DELETE_TCB:
+        return PhTcpStateStrings[State].Key;
+    case MIB_TCP_STATE_RESERVED:
+        return PhTcpStateStrings[13].Key;
+    }
+
+    // TODO: We can't index the string from MIB_TCP_STATE_RESERVED (dmex)
+    //if (PhIndexStringRefSiKeyValuePairs(
+    //    PhTcpStateStrings,
+    //    sizeof(PhTcpStateStrings),
+    //    State,
+    //    &string
+    //    ))
+    //{
+    //    return string;
+    //}
+
+    return PhTcpStateStrings[0].Key;
+}
+
+VOID PhQueryUdpExemptPortRange(
+    _Inout_ PRTL_BITMAP PortBitmap
+    )
+{
+    static const PH_STRINGREF TcpipParametersKey = PH_STRINGREF_INIT(L"System\\CurrentControlSet\\Services\\Tcpip\\Parameters");
+    static const PH_STRINGREF UdpExemptPortRangeValue = PH_STRINGREF_INIT(L"UdpExemptPortRange");
+    HANDLE keyHandle;
+
+    if (NT_SUCCESS(PhOpenKey(
+        &keyHandle,
+        KEY_QUERY_VALUE,
+        PH_KEY_LOCAL_MACHINE,
+        &TcpipParametersKey,
+        0
+        )))
+    {
+        PKEY_VALUE_PARTIAL_INFORMATION valueInfo;
+        LARGE_INTEGER lastWriteTime;
+        LARGE_INTEGER bootTime;
+
+        // UdpExemptPortRange is only applied by the TCP/IP stack at boot. If the key was
+        // modified after the last boot, the current value isn't active yet, so ignore it
+        // until the next restart.
+
+        if (
+            NT_SUCCESS(PhQueryKeyLastWriteTime(keyHandle, &lastWriteTime)) &&
+            NT_SUCCESS(PhGetSystemBootTime(&bootTime)) &&
+            lastWriteTime.QuadPart > bootTime.QuadPart
+            )
+        {
+            NtClose(keyHandle);
+            return;
+        }
+
+        if (NT_SUCCESS(PhQueryValueKey(
+            keyHandle,
+            &UdpExemptPortRangeValue,
+            KeyValuePartialInformation,
+            &valueInfo
+            )))
+        {
+            if (valueInfo->Type == REG_MULTI_SZ && !(valueInfo->DataLength % sizeof(WCHAR)))
+            {
+                static const PH_STRINGREF whitespace = PH_STRINGREF_INIT(L" \t");
+                PWCHAR cursor = (PWCHAR)valueInfo->Data;
+                PWCHAR end = (PWCHAR)PTR_ADD_OFFSET(valueInfo->Data, valueInfo->DataLength);
+
+                while (cursor < end)
+                {
+                    PH_STRINGREF remaining;
+
+                    // Walk one null-terminated MULTI_SZ string at a time. Each string is a
+                    // list of comma-separated port ranges (e.g. "5000-5100,7000").
+
+                    remaining.Buffer = cursor;
+                    remaining.Length = 0;
+
+                    while (cursor < end && *cursor != UNICODE_NULL)
+                    {
+                        remaining.Length += sizeof(WCHAR);
+                        cursor++;
+                    }
+
+                    if (cursor < end)
+                        cursor++; // skip the string's null terminator
+
+                    while (remaining.Length != 0)
+                    {
+                        PH_STRINGREF token;
+                        PH_STRINGREF firstPart;
+                        PH_STRINGREF lastPart;
+                        ULONG64 firstPort;
+                        ULONG64 lastPort;
+
+                        PhSplitStringRefAtChar(&remaining, L',', &token, &remaining);
+
+                        // Split "first-last"; a token without '-' is a single port.
+                        if (!PhSplitStringRefAtChar(&token, L'-', &firstPart, &lastPart))
+                        {
+                            lastPart = firstPart;
+                        }
+
+                        PhTrimStringRef(&firstPart, &whitespace, 0);
+                        PhTrimStringRef(&lastPart, &whitespace, 0);
+
+                        if (
+                            PhStringToUInt64(&firstPart, 10, &firstPort) &&
+                            PhStringToUInt64(&lastPart, 10, &lastPort) &&
+                            firstPort <= USHRT_MAX &&
+                            lastPort <= USHRT_MAX &&
+                            firstPort <= lastPort
+                            )
+                        {
+#ifndef PH_UDP_EXEMPT_RTL_BITMAP
+                            RtlSetBits(PortBitmap, (ULONG)firstPort, (ULONG)(lastPort - firstPort + 1));
+#else
+                            PULONG buffer = PortBitmap->Buffer;
+                            ULONG currentPort;
+
+                            for (currentPort = (ULONG)firstPort; currentPort <= (ULONG)lastPort; currentPort++)
+                            {
+                                buffer[currentPort / 32] |= 1UL << (currentPort % 32);
+                            }
+#endif
+                        }
+                    }
+                }
+            }
+
+            PhFree(valueInfo);
+        }
+
+        NtClose(keyHandle);
+    }
+}
+
+BOOLEAN PhIsUdpExemptPort(
+    _In_ ULONG Port
+    )
+{
+    static PH_INITONCE initOnce = PH_INITONCE_INIT;
+    static ULONG portBitmapBuffer[USHRT_MAX / 32 + 1];
+    static RTL_BITMAP portBitmap;
+
+    if (PhBeginInitOnce(&initOnce))
+    {
+        RtlInitializeBitMap(&portBitmap, portBitmapBuffer, USHRT_MAX + 1);
+        PhQueryUdpExemptPortRange(&portBitmap);
+        PhEndInitOnce(&initOnce);
+    }
+
+    if (Port > USHRT_MAX)
+        return FALSE;
+
+#ifndef PH_UDP_EXEMPT_RTL_BITMAP
+    return !!RtlTestBit(&portBitmap, Port);
+#else
+    return BooleanFlagOn(portBitmapBuffer[Port / 32], 1UL << (Port % 32));
+#endif
+}

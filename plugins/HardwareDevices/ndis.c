@@ -1,0 +1,1001 @@
+/*
+ * Copyright (c) 2022 Winsider Seminars & Solutions, Inc.  All rights reserved.
+ *
+ * This file is part of System Informer.
+ *
+ * Authors:
+ *
+ *     dmex    2015-2022
+ *
+ */
+
+#include "devices.h"
+#include <objbase.h>
+
+static PH_INITONCE IphlpapiInitOnce = PH_INITONCE_INIT;
+static PVOID IphlpapiBaseAddress = NULL;
+
+static typeof(&NhGetInterfaceDescriptionFromGuid) NhGetInterfaceDescriptionFromGuid_I = NULL;
+static typeof(&NhGetInterfaceNameFromDeviceGuid) NhGetInterfaceNameFromDeviceGuid_I = NULL;
+static typeof(&NhGetInterfaceNameFromGuid) NhGetInterfaceNameFromGuid_I = NULL;
+static typeof(&NhGetGuidFromInterfaceName) NhGetGuidFromInterfaceName_I = NULL;
+static typeof(&GetAdaptersAddresses) GetAdaptersAddresses_I = NULL;
+static typeof(&ConvertInterfaceLuidToNameW) ConvertInterfaceLuidToNameW_I = NULL;
+static typeof(&NotifyIpInterfaceChange) NotifyIpInterfaceChange_I = NULL;
+static typeof(&CancelMibChangeNotify2) CancelMibChangeNotify2_I = NULL;
+static typeof(&GetIfEntry2) GetIfEntry2_I = NULL;
+static typeof(&GetIfEntry2Ex) GetIfEntry2Ex_I = NULL;
+static typeof(&ConvertInterfaceLuidToAlias) ConvertInterfaceLuidToAlias_I = NULL;
+
+/**
+ * Initializes lazy imports from iphlpapi.dll.
+ *
+ * \return TRUE if the library was loaded successfully.
+ */
+static BOOLEAN NetworkAdapterInitializeIphlpApiFunctionImports(
+    VOID
+    )
+{
+    if (PhBeginInitOnce(&IphlpapiInitOnce))
+    {
+        if (IphlpapiBaseAddress = PhLoadLibrary(L"iphlpapi.dll"))
+        {
+            NhGetInterfaceDescriptionFromGuid_I = PhGetProcedureAddress(IphlpapiBaseAddress, "NhGetInterfaceDescriptionFromGuid", 0);
+            NhGetInterfaceNameFromDeviceGuid_I = PhGetProcedureAddress(IphlpapiBaseAddress, "NhGetInterfaceNameFromDeviceGuid", 0);
+            NhGetInterfaceNameFromGuid_I = PhGetProcedureAddress(IphlpapiBaseAddress, "NhGetInterfaceNameFromGuid", 0);
+            GetAdaptersAddresses_I = PhGetProcedureAddress(IphlpapiBaseAddress, "GetAdaptersAddresses", 0);
+            ConvertInterfaceLuidToNameW_I = PhGetProcedureAddress(IphlpapiBaseAddress, "ConvertInterfaceLuidToNameW", 0);
+            NotifyIpInterfaceChange_I = PhGetProcedureAddress(IphlpapiBaseAddress, "NotifyIpInterfaceChange", 0);
+            CancelMibChangeNotify2_I = PhGetProcedureAddress(IphlpapiBaseAddress, "CancelMibChangeNotify2", 0);
+            GetIfEntry2_I = PhGetProcedureAddress(IphlpapiBaseAddress, "GetIfEntry2", 0);
+            GetIfEntry2Ex_I = PhGetProcedureAddress(IphlpapiBaseAddress, "GetIfEntry2Ex", 0);
+            ConvertInterfaceLuidToAlias_I = PhGetProcedureAddress(IphlpapiBaseAddress, "ConvertInterfaceLuidToAlias", 0);
+        }
+
+        PhEndInitOnce(&IphlpapiInitOnce);
+    }
+
+    if (IphlpapiBaseAddress)
+        return TRUE;
+
+    return FALSE;
+}
+
+/**
+ * Checks whether an adapter supports the NDIS OIDs required by the plugin.
+ *
+ * \param DeviceHandle Adapter device handle.
+ * \return TRUE if all required queries are supported.
+ */
+BOOLEAN NetworkAdapterQuerySupported(
+    _In_ HANDLE DeviceHandle
+    )
+{
+    static NDIS_OID objectIdQuery = OID_GEN_SUPPORTED_LIST;
+    NTSTATUS status;
+    BOOLEAN ndisQuerySupported = FALSE;
+    BOOLEAN adapterNameSupported = FALSE;
+    BOOLEAN adapterStatsSupported = FALSE;
+    BOOLEAN adapterLinkStateSupported = FALSE;
+    BOOLEAN adapterLinkSpeedSupported = FALSE;
+    PNDIS_OID objectIdBuffer;
+    ULONG objectIdBufferLength;
+    ULONG objectIdBufferReturnLength;
+    ULONG attempts = 0;
+
+    objectIdBufferLength = 2048 * sizeof(NDIS_OID);
+    objectIdBuffer = PhAllocateZero(objectIdBufferLength);
+
+    status = PhDeviceIoControlFile(
+        DeviceHandle,
+        IOCTL_NDIS_QUERY_GLOBAL_STATS,
+        &objectIdQuery,
+        sizeof(NDIS_OID),
+        objectIdBuffer,
+        objectIdBufferLength,
+        &objectIdBufferReturnLength
+        );
+
+    while (status == STATUS_BUFFER_OVERFLOW && attempts < 8)
+    {
+        PhFree(objectIdBuffer);
+        objectIdBufferLength *= 2;
+        objectIdBuffer = PhAllocateZero(objectIdBufferLength);
+
+        status = PhDeviceIoControlFile(
+            DeviceHandle,
+            IOCTL_NDIS_QUERY_GLOBAL_STATS,
+            &objectIdQuery,
+            sizeof(NDIS_OID),
+            objectIdBuffer,
+            objectIdBufferLength,
+            &objectIdBufferReturnLength
+            );
+        attempts++;
+    }
+
+    if (NT_SUCCESS(status))
+    {
+        ndisQuerySupported = TRUE;
+
+        for (ULONG i = 0; i < objectIdBufferReturnLength / sizeof(NDIS_OID); i++)
+        {
+            NDIS_OID objectId = objectIdBuffer[i];
+
+            switch (objectId)
+            {
+            case OID_GEN_FRIENDLY_NAME:
+                adapterNameSupported = TRUE;
+                break;
+            case OID_GEN_STATISTICS:
+                adapterStatsSupported = TRUE;
+                break;
+            case OID_GEN_LINK_STATE:
+                adapterLinkStateSupported = TRUE;
+                break;
+            case OID_GEN_LINK_SPEED:
+                adapterLinkSpeedSupported = TRUE;
+                break;
+            }
+        }
+    }
+
+    PhFree(objectIdBuffer);
+
+    if (!adapterNameSupported)
+        ndisQuerySupported = FALSE;
+    if (!adapterStatsSupported)
+        ndisQuerySupported = FALSE;
+    if (!adapterLinkStateSupported)
+        ndisQuerySupported = FALSE;
+    if (!adapterLinkSpeedSupported)
+        ndisQuerySupported = FALSE;
+
+    return ndisQuerySupported;
+}
+
+/**
+ * Queries the adapter's NDIS driver version.
+ *
+ * \param DeviceHandle Adapter device handle.
+ * \param MajorVersion Receives the major version, if requested.
+ * \param MinorVersion Receives the minor version, if requested.
+ * \return NTSTATUS result of the query.
+ */
+NTSTATUS NetworkAdapterQueryNdisVersion(
+    _In_ HANDLE DeviceHandle,
+    _Out_opt_ PULONG MajorVersion,
+    _Out_opt_ PULONG MinorVersion
+    )
+{
+    static NDIS_OID objectIdQuery = OID_GEN_DRIVER_VERSION; // OID_GEN_VENDOR_DRIVER_VERSION
+    ULONG versionResult = 0;
+    NTSTATUS status;
+
+    status = PhDeviceIoControlFile(
+        DeviceHandle,
+        IOCTL_NDIS_QUERY_GLOBAL_STATS,
+        &objectIdQuery,
+        sizeof(NDIS_OID),
+        &versionResult,
+        sizeof(versionResult),
+        NULL
+        );
+
+    if (NT_SUCCESS(status))
+    {
+        if (MajorVersion)
+        {
+            *MajorVersion = HIBYTE(versionResult);
+        }
+
+        if (MinorVersion)
+        {
+            *MinorVersion = LOBYTE(versionResult);
+        }
+    }
+
+    return status;
+}
+
+/**
+ * Resolves an interface GUID to its alias name.
+ *
+ * \param InterfaceGuid Interface GUID.
+ * \return The alias name string, or NULL on failure.
+ */
+PPH_STRING NetworkAdapterGetInterfaceAliasNameFromGuid(
+    _In_ PGUID InterfaceGuid
+    )
+{
+    WCHAR adapterAlias[NDIS_IF_MAX_STRING_SIZE + 1] = L"";
+    SIZE_T adapterAliasLength = sizeof(adapterAlias);
+
+    if (!NetworkAdapterInitializeIphlpApiFunctionImports())
+        return NULL;
+
+    if (NhGetInterfaceNameFromGuid_I && HR_SUCCESS(NhGetInterfaceNameFromGuid_I(
+        InterfaceGuid,
+        adapterAlias,
+        &adapterAliasLength,
+        FALSE,
+        TRUE
+        )))
+    {
+        return PhCreateString(adapterAlias);
+    }
+
+    return NULL;
+}
+
+/**
+ * Resolves an interface GUID to its descriptive name.
+ *
+ * \param InterfaceGuid Interface GUID.
+ * \return The interface description string, or NULL on failure.
+ */
+PPH_STRING NetworkAdapterQueryNameFromInterfaceGuid(
+    _In_ PGUID InterfaceGuid
+    )
+{
+    WCHAR adapterDescription[NDIS_IF_MAX_STRING_SIZE + 1] = L"";
+    SIZE_T adapterDescriptionLength = sizeof(adapterDescription);
+
+    if (!NetworkAdapterInitializeIphlpApiFunctionImports())
+        return NULL;
+
+    if (NhGetInterfaceDescriptionFromGuid_I && HR_SUCCESS(NhGetInterfaceDescriptionFromGuid_I(
+        InterfaceGuid,
+        adapterDescription,
+        &adapterDescriptionLength,
+        FALSE,
+        TRUE
+        )))
+    {
+        return PhCreateString(adapterDescription);
+    }
+
+    return NULL;
+}
+
+/**
+ * Resolves a device GUID to its interface name.
+ *
+ * \param InterfaceGuid Device GUID.
+ * \return The interface name string, or NULL on failure.
+ */
+PPH_STRING NetworkAdapterQueryNameFromDeviceGuid(
+    _In_ PGUID InterfaceGuid
+    )
+{
+    WCHAR adapterAlias[NDIS_IF_MAX_STRING_SIZE + 1] = L"";
+    ULONG adapterAliasLength = sizeof(adapterAlias);
+
+    if (!NetworkAdapterInitializeIphlpApiFunctionImports())
+        return NULL;
+
+    if (NhGetInterfaceNameFromDeviceGuid_I && HR_SUCCESS(NhGetInterfaceNameFromDeviceGuid_I(
+        InterfaceGuid,
+        adapterAlias,
+        &adapterAliasLength,
+        FALSE,
+        TRUE
+        )))
+    {
+        return PhCreateString(adapterAlias);
+    }
+
+    return NULL;
+}
+
+/**
+ * Resolves an adapter LUID to its alias string.
+ *
+ * \param Id Network adapter identifier.
+ * \return The alias string, or NULL on failure.
+ */
+PPH_STRING NetworkAdapterGetInterfaceAliasFromLuid(
+    _In_ PDV_NETADAPTER_ID Id
+    )
+{
+    WCHAR aliasBuffer[IF_MAX_STRING_SIZE + 1];
+
+    if (!NetworkAdapterInitializeIphlpApiFunctionImports())
+        return NULL;
+
+    if (ConvertInterfaceLuidToAlias_I && NETIO_SUCCESS(ConvertInterfaceLuidToAlias_I(
+        &Id->InterfaceLuid,
+        aliasBuffer,
+        IF_MAX_STRING_SIZE
+        )))
+    {
+        return PhCreateString(aliasBuffer);
+    }
+
+    return NULL;
+}
+
+/**
+ * Resolves an adapter LUID to its interface name.
+ *
+ * \param Id Network adapter identifier.
+ * \return The interface name string, or NULL on failure.
+ */
+PPH_STRING NetworkAdapterGetInterfaceNameFromLuid(
+    _In_ PDV_NETADAPTER_ID Id
+    )
+{
+    WCHAR interfaceName[IF_MAX_STRING_SIZE + 1];
+
+    if (!NetworkAdapterInitializeIphlpApiFunctionImports())
+        return NULL;
+
+    if (ConvertInterfaceLuidToNameW_I && NETIO_SUCCESS(ConvertInterfaceLuidToNameW_I(
+        &Id->InterfaceLuid,
+        interfaceName,
+        IF_MAX_STRING_SIZE
+        )))
+    {
+        return PhCreateString(interfaceName);
+    }
+
+    return NULL;
+}
+
+/**
+ * Queries the adapter vendor description through NDIS.
+ *
+ * \param DeviceHandle Adapter device handle.
+ * \return The adapter description string, or NULL on failure.
+ */
+PPH_STRING NetworkAdapterQueryDescription(
+    _In_ HANDLE DeviceHandle
+    )
+{
+    static NDIS_OID objectIdQuery = OID_GEN_VENDOR_DESCRIPTION;
+    ULONG adapterDescReturnLength;
+    WCHAR adapterDescription[NDIS_IF_MAX_STRING_SIZE + 1] = L"";
+
+    if (NT_SUCCESS(PhDeviceIoControlFile(
+        DeviceHandle,
+        IOCTL_NDIS_QUERY_GLOBAL_STATS,
+        &objectIdQuery,
+        sizeof(NDIS_OID),
+        adapterDescription,
+        sizeof(adapterDescription),
+        &adapterDescReturnLength
+        )))
+    {
+        PPH_STRING string;
+
+        if (adapterDescReturnLength > sizeof(UNICODE_NULL))
+        {
+            string = PhCreateStringEx(adapterDescription, adapterDescReturnLength - sizeof(UNICODE_NULL));
+            //PhTrimToNullTerminatorString(string);
+        }
+        else
+        {
+            string = PhCreateString(adapterDescription);
+        }
+
+        return string;
+    }
+
+    return NULL;
+}
+
+/**
+ * Queries the adapter friendly name through NDIS.
+ *
+ * \param DeviceHandle Adapter device handle.
+ * \return The adapter name string, or NULL on failure.
+ */
+PPH_STRING NetworkAdapterQueryName(
+    _In_ HANDLE DeviceHandle
+    )
+{
+    static NDIS_OID objectIdQuery = OID_GEN_FRIENDLY_NAME;
+    ULONG adapterNameReturnLength;
+    WCHAR adapterName[NDIS_IF_MAX_STRING_SIZE + 1] = L"";
+
+    if (NT_SUCCESS(PhDeviceIoControlFile(
+        DeviceHandle,
+        IOCTL_NDIS_QUERY_GLOBAL_STATS,
+        &objectIdQuery,
+        sizeof(NDIS_OID),
+        adapterName,
+        sizeof(adapterName),
+        &adapterNameReturnLength
+        )))
+    {
+        PPH_STRING string;
+
+        if (adapterNameReturnLength > sizeof(UNICODE_NULL))
+        {
+            string = PhCreateStringEx(adapterName, adapterNameReturnLength - sizeof(UNICODE_NULL));
+            //PhTrimToNullTerminatorString(string);
+        }
+        else
+        {
+            string = PhCreateString(adapterName);
+        }
+
+        return string;
+    }
+
+    return NULL;
+}
+
+/**
+ * Queries adapter traffic statistics.
+ *
+ * \param DeviceHandle Adapter device handle.
+ * \param Info Receives the NDIS statistics structure.
+ * \return NTSTATUS result of the query.
+ */
+NTSTATUS NetworkAdapterQueryStatistics(
+    _In_ HANDLE DeviceHandle,
+    _Out_ PNDIS_STATISTICS_INFO Info
+    )
+{
+    static NDIS_OID objectIdQuery = OID_GEN_STATISTICS;
+
+    memset(Info, 0, sizeof(NDIS_STATISTICS_INFO));
+    Info->Header.Type = NDIS_OBJECT_TYPE_DEFAULT;
+    Info->Header.Revision = NDIS_STATISTICS_INFO_REVISION_1;
+    Info->Header.Size = NDIS_SIZEOF_STATISTICS_INFO_REVISION_1;
+
+    return PhDeviceIoControlFile(
+        DeviceHandle,
+        IOCTL_NDIS_QUERY_GLOBAL_STATS,
+        &objectIdQuery,
+        sizeof(NDIS_OID),
+        Info,
+        sizeof(NDIS_STATISTICS_INFO),
+        NULL
+        );
+}
+
+/**
+ * Queries the current adapter link state.
+ *
+ * \param DeviceHandle Adapter device handle.
+ * \param State Receives the link state.
+ * \return NTSTATUS result of the query.
+ */
+NTSTATUS NetworkAdapterQueryLinkState(
+    _In_ HANDLE DeviceHandle,
+    _Out_ PNDIS_LINK_STATE State
+    )
+{
+    static NDIS_OID objectIdQuery = OID_GEN_LINK_STATE; // OID_GEN_MEDIA_CONNECT_STATUS
+
+    memset(State, 0, sizeof(NDIS_LINK_STATE));
+    State->Header.Type = NDIS_OBJECT_TYPE_DEFAULT;
+    State->Header.Revision = NDIS_LINK_STATE_REVISION_1;
+    State->Header.Size = NDIS_SIZEOF_LINK_STATE_REVISION_1;
+
+    return PhDeviceIoControlFile(
+        DeviceHandle,
+        IOCTL_NDIS_QUERY_GLOBAL_STATS,
+        &objectIdQuery,
+        sizeof(NDIS_OID),
+        State,
+        sizeof(NDIS_LINK_STATE),
+        NULL
+        );
+}
+
+/**
+ * Queries the adapter physical media type.
+ *
+ * \param DeviceHandle Adapter device handle.
+ * \param Medium Receives the physical medium type.
+ * \return NTSTATUS result of the query.
+ */
+NTSTATUS NetworkAdapterQueryMediaType(
+    _In_ HANDLE DeviceHandle,
+    _Out_ PNDIS_PHYSICAL_MEDIUM Medium
+    )
+{
+    NTSTATUS status;
+    NDIS_OID objectIdQuery;
+    NDIS_MEDIUM adapterType;
+    NDIS_PHYSICAL_MEDIUM adapterMediaType;
+
+    objectIdQuery = OID_GEN_PHYSICAL_MEDIUM_EX;
+    adapterMediaType = NdisPhysicalMediumUnspecified;
+
+    status = PhDeviceIoControlFile(
+        DeviceHandle,
+        IOCTL_NDIS_QUERY_GLOBAL_STATS,
+        &objectIdQuery,
+        sizeof(objectIdQuery),
+        &adapterMediaType,
+        sizeof(adapterMediaType),
+        NULL
+        );
+
+    if (NT_SUCCESS(status))
+    {
+        *Medium = adapterMediaType;
+        return status;
+    }
+
+    objectIdQuery = OID_GEN_PHYSICAL_MEDIUM;
+    adapterMediaType = NdisPhysicalMediumUnspecified;
+
+    status = PhDeviceIoControlFile(
+        DeviceHandle,
+        IOCTL_NDIS_QUERY_GLOBAL_STATS,
+        &objectIdQuery,
+        sizeof(objectIdQuery),
+        &adapterMediaType,
+        sizeof(adapterMediaType),
+        NULL
+        );
+
+    if (NT_SUCCESS(status))
+    {
+        *Medium = adapterMediaType;
+        return TRUE;
+    }
+
+    objectIdQuery = OID_GEN_MEDIA_SUPPORTED; // OID_GEN_MEDIA_IN_USE
+    adapterType = NdisMediumMax;
+
+    status = PhDeviceIoControlFile(
+        DeviceHandle,
+        IOCTL_NDIS_QUERY_GLOBAL_STATS,
+        &objectIdQuery,
+        sizeof(objectIdQuery),
+        &adapterType,
+        sizeof(adapterType),
+        NULL
+        );
+
+    if (NT_SUCCESS(status))
+    {
+        switch (adapterType)
+        {
+        case NdisMedium802_3:
+            *Medium = NdisPhysicalMedium802_3;
+            break;
+        case NdisMedium802_5:
+            *Medium = NdisPhysicalMedium802_5;
+            break;
+        case NdisMediumWirelessWan:
+            *Medium = NdisPhysicalMediumWirelessLan;
+            break;
+        case NdisMediumWiMAX:
+            *Medium = NdisPhysicalMediumWiMax;
+            break;
+        default:
+            *Medium = NdisPhysicalMediumOther;
+            break;
+        }
+    }
+
+    return status;
+}
+
+/**
+ * Queries the adapter link speed.
+ *
+ * \param DeviceHandle Adapter device handle.
+ * \param LinkSpeed Receives the link speed in bits per second.
+ * \return NTSTATUS result of the query.
+ */
+NTSTATUS NetworkAdapterQueryLinkSpeed(
+    _In_ HANDLE DeviceHandle,
+    _Out_ PULONG64 LinkSpeed
+    )
+{
+    static NDIS_OID objectIdQuery = OID_GEN_LINK_SPEED;
+    NTSTATUS status;
+    NDIS_LINK_SPEED result;
+
+    memset(&result, 0, sizeof(NDIS_LINK_SPEED));
+
+    status = PhDeviceIoControlFile(
+        DeviceHandle,
+        IOCTL_NDIS_QUERY_GLOBAL_STATS,
+        &objectIdQuery,
+        sizeof(NDIS_OID),
+        &result,
+        sizeof(NDIS_LINK_SPEED),
+        NULL
+        );
+
+    if (NT_SUCCESS(status))
+    {
+        *LinkSpeed = UInt32x32To64(result.XmitLinkSpeed, NDIS_UNIT_OF_MEASUREMENT);
+    }
+
+    return status;
+}
+
+/**
+ * Queries a 64-bit NDIS counter value.
+ *
+ * \param DeviceHandle Adapter device handle.
+ * \param OpCode NDIS OID to query.
+ * \return Queried value, or 0 on failure.
+ */
+ULONG64 NetworkAdapterQueryValue(
+    _In_ HANDLE DeviceHandle,
+    _In_ NDIS_OID OpCode
+    )
+{
+    ULONG64 result = 0;
+
+    if (NT_SUCCESS(PhDeviceIoControlFile(
+        DeviceHandle,
+        IOCTL_NDIS_QUERY_GLOBAL_STATS,
+        &OpCode,
+        sizeof(NDIS_OID),
+        &result,
+        sizeof(result),
+        NULL
+        )))
+    {
+        return result;
+    }
+
+    return 0;
+}
+
+/**
+ * Queries a MIB interface row for the adapter.
+ *
+ * \param Id Network adapter identifier.
+ * \param Level Requested MIB query level.
+ * \param InterfaceRow Receives the interface row on success.
+ * \return TRUE if the row was queried successfully.
+ */
+_Success_(return)
+BOOLEAN NetworkAdapterQueryInterfaceRow(
+    _In_ PDV_NETADAPTER_ID Id,
+    _In_ MIB_IF_ENTRY_LEVEL Level,
+    _Out_ PMIB_IF_ROW2 InterfaceRow
+    )
+{
+    MIB_IF_ROW2 interfaceRow;
+
+    if (!NetworkAdapterInitializeIphlpApiFunctionImports())
+        return FALSE;
+
+    memset(&interfaceRow, 0, sizeof(MIB_IF_ROW2));
+    interfaceRow.InterfaceLuid = Id->InterfaceLuid;
+    interfaceRow.InterfaceIndex = Id->InterfaceIndex;
+
+    if (NetWindowsVersion >= WINDOWS_10_RS2)
+    {
+        if (GetIfEntry2Ex_I && NETIO_SUCCESS(GetIfEntry2Ex_I(Level, &interfaceRow)))
+        {
+            *InterfaceRow = interfaceRow;
+            return TRUE;
+        }
+    }
+
+    if (GetIfEntry2_I && NETIO_SUCCESS(GetIfEntry2_I(&interfaceRow)))
+    {
+        *InterfaceRow = interfaceRow;
+        return TRUE;
+    }
+
+    //MIB_IPINTERFACE_ROW interfaceTable;
+    //memset(&interfaceTable, 0, sizeof(MIB_IPINTERFACE_ROW));
+    //interfaceTable.Family = AF_INET;
+    //interfaceTable.InterfaceLuid.Value = Context->AdapterEntry->InterfaceLuidValue;
+    //interfaceTable.InterfaceIndex = Context->AdapterEntry->InterfaceIndex;
+    //GetIpInterfaceEntry(&interfaceTable);
+
+    return FALSE;
+}
+
+PVOID NetworkAdapterGetAddresses(
+    _In_ ULONG Family,
+    _In_ ULONG Flags
+    )
+{
+    ULONG bufferLength = 0;
+    PIP_ADAPTER_ADDRESSES buffer;
+
+    if (!NetworkAdapterInitializeIphlpApiFunctionImports())
+        return FALSE;
+
+    if (GetAdaptersAddresses_I(Family, Flags, NULL, NULL, &bufferLength) != ERROR_BUFFER_OVERFLOW)
+        return NULL;
+
+    buffer = PhAllocate(bufferLength);
+    memset(buffer, 0, bufferLength);
+
+    if (GetAdaptersAddresses_I(Family, Flags, NULL, buffer, &bufferLength) != ERROR_SUCCESS)
+    {
+        PhFree(buffer);
+        return NULL;
+    }
+
+    return buffer;
+}
+
+/**
+ * Converts an NDIS physical medium type to display text.
+ *
+ * \param MediumType Physical medium type.
+ * \return Constant display string for the medium type.
+ */
+PCWSTR MediumTypeToString(
+    _In_ NDIS_PHYSICAL_MEDIUM MediumType
+    )
+{
+    switch (MediumType)
+    {
+    case NdisPhysicalMediumWirelessLan:
+        return L"Wireless LAN";
+    case NdisPhysicalMediumCableModem:
+        return L"Cable Modem";
+    case NdisPhysicalMediumPhoneLine:
+        return L"Phone Line";
+    case NdisPhysicalMediumPowerLine:
+        return L"Power Line";
+    case NdisPhysicalMediumDSL:      // includes ADSL and UADSL (G.Lite)
+        return L"DSL";
+    case NdisPhysicalMediumFibreChannel:
+        return L"Fibre";
+    case NdisPhysicalMedium1394:
+        return L"1394";
+    case NdisPhysicalMediumWirelessWan:
+        return L"Wireless WAN";
+    case NdisPhysicalMediumNative802_11:
+        return L"Native802_11";
+    case NdisPhysicalMediumBluetooth:
+        return L"Bluetooth";
+    case NdisPhysicalMediumInfiniband:
+        return L"Infiniband";
+    case NdisPhysicalMediumWiMax:
+        return L"WiMax";
+    case NdisPhysicalMediumUWB:
+        return L"UWB";
+    case NdisPhysicalMedium802_3:
+        return L"Ethernet";
+    case NdisPhysicalMedium802_5:
+        return L"802_5";
+    case NdisPhysicalMediumIrda:
+        return L"Infrared";
+    case NdisPhysicalMediumWiredWAN:
+        return L"Wired WAN";
+    case NdisPhysicalMediumWiredCoWan:
+        return L"Wired CoWan";
+    case NdisPhysicalMediumOther:
+        return L"Other";
+    case NdisPhysicalMediumNative802_15_4:
+        return L"Native802_15_";
+    }
+
+    return L"N/A";
+}
+
+/**
+ * Formats a bitrate using SI prefixes.
+ *
+ * \param Value Raw bitrate value.
+ * \return Formatted bitrate string.
+ */
+PPH_STRING NetworkAdapterFormatBitratePrefix(
+    _In_ ULONG64 Value
+    )
+{
+    static const PH_STRINGREF SiPrefixUnitNamesCounted[7] =
+    {
+        PH_STRINGREF_INIT(L" Bps"),
+        PH_STRINGREF_INIT(L" Kbps"),
+        PH_STRINGREF_INIT(L" Mbps"),
+        PH_STRINGREF_INIT(L" Gbps"),
+        PH_STRINGREF_INIT(L" Tbps"),
+        PH_STRINGREF_INIT(L" Pbps"),
+        PH_STRINGREF_INIT(L" Ebps")
+    };
+    DOUBLE number = (DOUBLE)Value;
+    ULONG i = 0;
+    PH_FORMAT format[2];
+
+    while (
+        number >= 1000 &&
+        i < RTL_NUMBER_OF(SiPrefixUnitNamesCounted) &&
+        i < ULONG_MAX // PhMaxSizeUnit
+        )
+    {
+        number /= 1000;
+        i++;
+    }
+
+    format[0].Type = DoubleFormatType | FormatUsePrecision;
+    format[0].Precision = 1;
+    format[0].u.Double = number;
+    PhInitFormatSR(&format[1], SiPrefixUnitNamesCounted[i]);
+
+    return PhFormat(format, 2, 0);
+}
+
+//BOOLEAN NetworkAdapterQueryInternet(
+//    _Inout_ PDV_NETADAPTER_SYSINFO_CONTEXT Context,
+//    _In_ PPH_STRING IpAddress
+//    )
+//{
+//    // https://technet.microsoft.com/en-us/library/cc766017.aspx
+//    BOOLEAN socketResult = FALSE;
+//    DNS_STATUS dnsQueryStatus = DNS_ERROR_RCODE_NO_ERROR;
+//    PDNS_RECORD dnsQueryRecords = NULL;
+//
+//    __try
+//    {
+//        if ((dnsQueryStatus = DnsQuery(
+//            L"www.msftncsi.com",
+//            DNS_TYPE_A,
+//            DNS_QUERY_NO_HOSTS_FILE | DNS_QUERY_BYPASS_CACHE,
+//            NULL,
+//            &dnsQueryRecords,
+//            NULL
+//            )) != DNS_ERROR_RCODE_NO_ERROR)
+//        {
+//            __leave;
+//        }
+//
+//        for (PDNS_RECORD i = dnsQueryRecords; i != NULL; i = i->pNext)
+//        {
+//            if (i->wType == DNS_TYPE_A)
+//            {
+//                SOCKET socketHandle = INVALID_SOCKET;
+//
+//                if ((socketHandle = WSASocket(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, WSA_FLAG_NO_HANDLE_INHERIT)) == INVALID_SOCKET)
+//                    continue;
+//
+//                IN_ADDR sockAddr;
+//                InetPton(AF_INET, IpAddress->Buffer, &sockAddr);
+//
+//                SOCKADDR_IN localaddr = { 0 };
+//                localaddr.sin_family = AF_INET;
+//                localaddr.sin_addr.s_addr = sockAddr.s_addr;
+//
+//                if (bind(socketHandle, (PSOCKADDR)&localaddr, sizeof(localaddr)) == SOCKET_ERROR)
+//                {
+//                    closesocket(socketHandle);
+//                    continue;
+//                }
+//
+//                SOCKADDR_IN remoteAddr;
+//                remoteAddr.sin_family = AF_INET;
+//                remoteAddr.sin_port = htons(80);
+//                remoteAddr.sin_addr.s_addr = i->Data.A.IpAddress;
+//
+//                if (WSAConnect(socketHandle, (PSOCKADDR)&remoteAddr, sizeof(remoteAddr), NULL, NULL, NULL, NULL) != SOCKET_ERROR)
+//                {
+//                    socketResult = TRUE;
+//                    closesocket(socketHandle);
+//                    break;
+//                }
+//
+//                closesocket(socketHandle);
+//            }
+//        }
+//    }
+//    __finally
+//    {
+//        if (dnsQueryRecords)
+//        {
+//            DnsFree(dnsQueryRecords, DnsFreeRecordList);
+//        }
+//    }
+//
+//    __try
+//    {
+//        if ((dnsQueryStatus = DnsQuery(
+//            L"ipv6.msftncsi.com",
+//            DNS_TYPE_AAAA,
+//            DNS_QUERY_NO_HOSTS_FILE | DNS_QUERY_BYPASS_CACHE, //  | DNS_QUERY_DUAL_ADDR
+//            NULL,
+//            &dnsQueryRecords,
+//            NULL
+//            )) != DNS_ERROR_RCODE_NO_ERROR)
+//        {
+//            __leave;
+//        }
+//
+//        for (PDNS_RECORD i = dnsQueryRecords; i != NULL; i = i->pNext)
+//        {
+//            if (i->wType == DNS_TYPE_AAAA)
+//            {
+//                SOCKET socketHandle = INVALID_SOCKET;
+//
+//                if ((socketHandle = WSASocket(AF_INET6, SOCK_STREAM, IPPROTO_TCP, NULL, 0, WSA_FLAG_NO_HANDLE_INHERIT)) == INVALID_SOCKET)
+//                    continue;
+//
+//                IN6_ADDR sockAddr;
+//                InetPton(AF_INET6, IpAddress->Buffer, &sockAddr);
+//
+//                SOCKADDR_IN6 remoteAddr = { 0 };
+//                remoteAddr.sin6_family = AF_INET6;
+//                remoteAddr.sin6_port = htons(80);
+//                memcpy(&remoteAddr.sin6_addr.s6_addr, i->Data.AAAA.Ip6Address.IP6Byte, sizeof(i->Data.AAAA.Ip6Address.IP6Byte));
+//
+//                if (WSAConnect(socketHandle, (PSOCKADDR)&remoteAddr, sizeof(SOCKADDR_IN6), NULL, NULL, NULL, NULL) != SOCKET_ERROR)
+//                {
+//                    socketResult = TRUE;
+//                    closesocket(socketHandle);
+//                    break;
+//                }
+//
+//                closesocket(socketHandle);
+//            }
+//        }
+//    }
+//    __finally
+//    {
+//        if (dnsQueryRecords)
+//        {
+//            DnsFree(dnsQueryRecords, DnsFreeRecordList);
+//        }
+//    }
+//
+//    WSACleanup();
+//
+//    return socketResult;
+//}
+
+// IPv4 subnet mask table: Ipv4Mask[0..32]
+static const ULONG Ipv4Mask[33] =
+{
+    0x00000000, // /0  = 0.0.0.0
+    0x80000000, // /1  = 128.0.0.0
+    0xC0000000, // /2  = 192.0.0.0
+    0xE0000000, // /3  = 224.0.0.0
+    0xF0000000, // /4  = 240.0.0.0
+    0xF8000000, // /5  = 248.0.0.0
+    0xFC000000, // /6  = 252.0.0.0
+    0xFE000000, // /7  = 254.0.0.0
+    0xFF000000, // /8  = 255.0.0.0
+    0xFF800000, // /9  = 255.128.0.0
+    0xFFC00000, // /10 = 255.192.0.0
+    0xFFE00000, // /11 = 255.224.0.0
+    0xFFF00000, // /12 = 255.240.0.0
+    0xFFF80000, // /13 = 255.248.0.0
+    0xFFFC0000, // /14 = 255.252.0.0
+    0xFFFE0000, // /15 = 255.254.0.0
+    0xFFFF0000, // /16 = 255.255.0.0
+    0xFFFF8000, // /17 = 255.255.128.0
+    0xFFFFC000, // /18 = 255.255.192.0
+    0xFFFFE000, // /19 = 255.255.224.0
+    0xFFFFF000, // /20 = 255.255.240.0
+    0xFFFFF800, // /21 = 255.255.248.0
+    0xFFFFFC00, // /22 = 255.255.252.0
+    0xFFFFFE00, // /23 = 255.255.254.0
+    0xFFFFFF00, // /24 = 255.255.255.0
+    0xFFFFFF80, // /25 = 255.255.255.128
+    0xFFFFFFC0, // /26 = 255.255.255.192
+    0xFFFFFFE0, // /27 = 255.255.255.224
+    0xFFFFFFF0, // /28 = 255.255.255.240
+    0xFFFFFFF8, // /29 = 255.255.255.248
+    0xFFFFFFFC, // /30 = 255.255.255.252
+    0xFFFFFFFE, // /31 = 255.255.255.254
+    0xFFFFFFFF  // /32 = 255.255.255.255
+};
+
+// rev from ConvertLengthToIpv4Mask
+NTSTATUS NetworkAdapterConvertLengthToIpv4Mask(
+    _In_ ULONG MaskLength,
+    _Out_ PULONG Mask
+    )
+{
+    if (MaskLength >= RTL_NUMBER_OF(Ipv4Mask))
+    {
+        *Mask = ULONG_MAX;
+        return STATUS_INVALID_PARAMETER;
+    }
+    else
+    {
+        *Mask = Ipv4Mask[MaskLength];
+        return STATUS_SUCCESS;
+    }
+}

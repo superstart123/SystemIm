@@ -1,0 +1,486 @@
+/*
+ * Copyright (c) 2022 Winsider Seminars & Solutions, Inc.  All rights reserved.
+ *
+ * This file is part of System Informer.
+ *
+ * Authors:
+ *
+ *     dmex    2016-2026
+ *
+ */
+
+#include "exttools.h"
+#include "poolmon.h"
+
+static HWND EtPoolTagDialogHandle = NULL;
+static HANDLE EtPoolTagDialogThreadHandle = NULL;
+static PH_EVENT EtPoolTagDialogInitializedEvent = PH_EVENT_INIT;
+
+VOID EtUpdatePoolTagTable(
+    _Inout_ PPOOLTAG_CONTEXT Context
+    )
+{
+    PSYSTEM_POOLTAG_INFORMATION poolTagTable;
+
+    if (!NT_SUCCESS(PhEnumPoolTagInformation(&poolTagTable)))
+        return;
+
+    for (ULONG i = 0; i < poolTagTable->Count; i++)
+    {
+        PPOOLTAG_ROOT_NODE node;
+        SYSTEM_POOLTAG poolTagInfo;
+
+        poolTagInfo = poolTagTable->TagInfo[i];
+
+        if (node = EtFindPoolTagNode(Context, poolTagInfo.TagUlong))
+        {
+            PhUpdateDelta(&node->PoolItem->PagedAllocsDelta, poolTagInfo.PagedAllocs);
+            PhUpdateDelta(&node->PoolItem->PagedFreesDelta, poolTagInfo.PagedFrees);
+            PhUpdateDelta(&node->PoolItem->PagedCurrentDelta, poolTagInfo.PagedAllocs - poolTagInfo.PagedFrees);
+            PhUpdateDelta(&node->PoolItem->PagedTotalSizeDelta, poolTagInfo.PagedUsed);
+            PhUpdateDelta(&node->PoolItem->NonPagedAllocsDelta, poolTagInfo.NonPagedAllocs);
+            PhUpdateDelta(&node->PoolItem->NonPagedFreesDelta, poolTagInfo.NonPagedFrees);
+            PhUpdateDelta(&node->PoolItem->NonPagedCurrentDelta, poolTagInfo.NonPagedAllocs - poolTagInfo.NonPagedFrees);
+            PhUpdateDelta(&node->PoolItem->NonPagedTotalSizeDelta, poolTagInfo.NonPagedUsed);
+            PhUpdateDelta(&node->PoolItem->AllocsDelta, poolTagInfo.PagedAllocs + poolTagInfo.NonPagedAllocs);
+            PhUpdateDelta(&node->PoolItem->FreesDelta, poolTagInfo.PagedFrees + poolTagInfo.NonPagedFrees);
+            PhUpdateDelta(&node->PoolItem->CurrentDelta, (poolTagInfo.PagedAllocs - poolTagInfo.PagedFrees) + (poolTagInfo.NonPagedAllocs - poolTagInfo.NonPagedFrees));
+            PhUpdateDelta(&node->PoolItem->TotalSizeDelta, poolTagInfo.PagedUsed + poolTagInfo.NonPagedUsed);
+
+            if (!node->PoolItem->HaveFirstSample)
+            {
+                node->PoolItem->PagedAllocsDelta.Delta = 0;
+                node->PoolItem->PagedFreesDelta.Delta = 0;
+                node->PoolItem->PagedCurrentDelta.Delta = 0;
+                node->PoolItem->PagedTotalSizeDelta.Delta = 0;
+                node->PoolItem->NonPagedAllocsDelta.Delta = 0;
+                node->PoolItem->NonPagedFreesDelta.Delta = 0;
+                node->PoolItem->NonPagedCurrentDelta.Delta = 0;
+                node->PoolItem->NonPagedTotalSizeDelta.Delta = 0;
+                node->PoolItem->AllocsDelta.Delta = 0;
+                node->PoolItem->FreesDelta.Delta = 0;
+                node->PoolItem->CurrentDelta.Delta = 0;
+                node->PoolItem->TotalSizeDelta.Delta = 0;
+                node->PoolItem->HaveFirstSample = TRUE;
+            }
+
+            EtUpdatePoolTagNode(Context, node);
+        }
+        else
+        {
+            PPOOL_ITEM entry;
+
+            entry = PhAllocateZero(sizeof(POOL_ITEM));
+            entry->TagUlong = poolTagInfo.TagUlong;
+            PhZeroExtendToUtf16Buffer(poolTagInfo.Tag, sizeof(poolTagInfo.Tag), entry->TagString);
+
+            PhUpdateDelta(&entry->PagedAllocsDelta, poolTagInfo.PagedAllocs);
+            PhUpdateDelta(&entry->PagedFreesDelta, poolTagInfo.PagedFrees);
+            PhUpdateDelta(&entry->PagedCurrentDelta, poolTagInfo.PagedAllocs - poolTagInfo.PagedFrees);
+            PhUpdateDelta(&entry->PagedTotalSizeDelta, poolTagInfo.PagedUsed);
+            PhUpdateDelta(&entry->NonPagedAllocsDelta, poolTagInfo.NonPagedAllocs);
+            PhUpdateDelta(&entry->NonPagedFreesDelta, poolTagInfo.NonPagedFrees);
+            PhUpdateDelta(&entry->NonPagedCurrentDelta, poolTagInfo.NonPagedAllocs - poolTagInfo.NonPagedFrees);
+            PhUpdateDelta(&entry->NonPagedTotalSizeDelta, poolTagInfo.NonPagedUsed);
+            PhUpdateDelta(&entry->AllocsDelta, poolTagInfo.PagedAllocs + poolTagInfo.NonPagedAllocs);
+            PhUpdateDelta(&entry->FreesDelta, poolTagInfo.PagedFrees + poolTagInfo.NonPagedFrees);
+            PhUpdateDelta(&entry->CurrentDelta, (poolTagInfo.PagedAllocs - poolTagInfo.PagedFrees) + (poolTagInfo.NonPagedAllocs - poolTagInfo.NonPagedFrees));
+            PhUpdateDelta(&entry->TotalSizeDelta, poolTagInfo.PagedUsed + poolTagInfo.NonPagedUsed);
+
+            entry->PagedAllocsDelta.Delta = 0;
+            entry->PagedFreesDelta.Delta = 0;
+            entry->PagedCurrentDelta.Delta = 0;
+            entry->PagedTotalSizeDelta.Delta = 0;
+            entry->NonPagedAllocsDelta.Delta = 0;
+            entry->NonPagedFreesDelta.Delta = 0;
+            entry->NonPagedCurrentDelta.Delta = 0;
+            entry->NonPagedTotalSizeDelta.Delta = 0;
+            entry->AllocsDelta.Delta = 0;
+            entry->FreesDelta.Delta = 0;
+            entry->CurrentDelta.Delta = 0;
+            entry->TotalSizeDelta.Delta = 0;
+            entry->HaveFirstSample = TRUE;
+
+            EtUpdatePoolTagBinaryName(Context, entry, poolTagInfo.TagUlong);
+
+            EtAddPoolTagNode(Context, entry);
+        }
+    }
+
+    TreeNew_NodesStructured(Context->TreeNewHandle);
+
+    PhFree(poolTagTable);
+}
+
+_Function_class_(PH_TN_FILTER_FUNCTION)
+BOOLEAN EtPoolTagTreeFilterCallback(
+    _In_ PPH_TREENEW_NODE Node,
+    _In_ PVOID Context
+    )
+{
+    PPOOLTAG_ROOT_NODE poolNode = (PPOOLTAG_ROOT_NODE)Node;
+    PPOOLTAG_CONTEXT context = Context;
+
+    if (!context->SearchMatchHandle)
+        return TRUE;
+
+    if (poolNode->PoolItem->TagString[0] != 0)
+    {
+        if (PhSearchControlMatchLongHintZ(context->SearchMatchHandle, poolNode->PoolItem->TagString))
+            return TRUE;
+    }
+
+    if (!PhIsNullOrEmptyString(poolNode->PoolItem->BinaryNameString))
+    {
+        if (PhSearchControlMatch(context->SearchMatchHandle, &poolNode->PoolItem->BinaryNameString->sr))
+            return TRUE;
+    }
+
+    if (!PhIsNullOrEmptyString(poolNode->PoolItem->DescriptionString))
+    {
+        if (PhSearchControlMatch(context->SearchMatchHandle, &poolNode->PoolItem->DescriptionString->sr))
+            return TRUE;
+    }
+
+    return FALSE;
+}
+
+_Function_class_(PH_CALLBACK_FUNCTION)
+VOID NTAPI EtPoolMonProcessesUpdatedCallback(
+    _In_ PVOID Parameter,
+    _In_ PVOID Context
+    )
+{
+    PPH_PROVIDER_UPDATED_EVENT updateEvent = Parameter;
+    PPOOLTAG_CONTEXT context = Context;
+
+    if (!updateEvent || updateEvent->RunCount < 3)
+        return;
+
+    EtUpdatePoolTagTable(Context);
+}
+
+_Function_class_(PH_SEARCHCONTROL_CALLBACK)
+VOID NTAPI EtPoolMonSearchControlCallback(
+    _In_ ULONG_PTR MatchHandle,
+    _In_opt_ PVOID Context
+    )
+{
+    PPOOLTAG_CONTEXT context;
+
+    context = Context;
+
+    assert(context);
+
+    context->SearchMatchHandle = MatchHandle;
+
+    PhApplyTreeNewFilters(&context->FilterSupport);
+}
+
+INT_PTR CALLBACK EtPoolMonDlgProc(
+    _In_ HWND WindowHandle,
+    _In_ UINT WindowMessage,
+    _In_ WPARAM wParam,
+    _In_ LPARAM lParam
+    )
+{
+    PPOOLTAG_CONTEXT context;
+
+    if (WindowMessage == WM_INITDIALOG)
+    {
+        context = PhAllocateZero(sizeof(POOLTAG_CONTEXT));
+        PhSetWindowContext(WindowHandle, PH_WINDOW_CONTEXT_DEFAULT, context);
+    }
+    else
+    {
+        context = PhGetWindowContext(WindowHandle, PH_WINDOW_CONTEXT_DEFAULT);
+    }
+
+    if (!context)
+        return FALSE;
+
+    switch (WindowMessage)
+    {
+    case WM_INITDIALOG:
+        {
+            context->WindowHandle = WindowHandle;
+            context->ParentWindowHandle = (HWND)lParam;
+            context->TreeNewHandle = GetDlgItem(WindowHandle, IDC_POOLTREE);
+            context->SearchboxHandle = GetDlgItem(WindowHandle, IDC_POOLSEARCH);
+            context->WindowFont = PhCreateApplicationFont(PhGetWindowDpi(WindowHandle));
+
+            PhSetApplicationWindowIcon(WindowHandle);
+
+            PhCreateSearchControl(
+                WindowHandle,
+                context->SearchboxHandle,
+                L"Search Pool Tags (Ctrl+K)",
+                EtPoolMonSearchControlCallback,
+                context
+                );
+
+            SetWindowFont(context->TreeNewHandle, context->WindowFont, FALSE);
+
+            EtInitializePoolTagTree(context);
+
+            PhInitializeLayoutManager(&context->LayoutManager, WindowHandle);
+            PhAddLayoutItem(&context->LayoutManager, context->TreeNewHandle, NULL, PH_ANCHOR_ALL);
+            PhAddLayoutItem(&context->LayoutManager, context->SearchboxHandle, NULL, PH_ANCHOR_BOTTOM | PH_ANCHOR_LEFT);
+            PhAddLayoutItem(&context->LayoutManager, GetDlgItem(WindowHandle, IDC_POOL_AUTOSIZE_COLUMNS), NULL, PH_ANCHOR_BOTTOM | PH_ANCHOR_LEFT);
+            PhAddLayoutItem(&context->LayoutManager, GetDlgItem(WindowHandle, IDCANCEL), NULL, PH_ANCHOR_BOTTOM | PH_ANCHOR_RIGHT);
+
+            if (PhValidWindowPlacementFromSetting(SETTING_NAME_POOL_WINDOW_POSITION))
+                PhLoadWindowPlacementFromSetting(SETTING_NAME_POOL_WINDOW_POSITION, SETTING_NAME_POOL_WINDOW_SIZE, WindowHandle);
+            else
+                PhCenterWindow(WindowHandle, context->ParentWindowHandle);
+
+            context->TreeFilterEntry = PhAddTreeNewFilter(
+                &context->FilterSupport,
+                EtPoolTagTreeFilterCallback,
+                context
+                );
+
+            EtLoadPoolTagDatabase(context);
+            EtUpdatePoolTagTable(context);
+
+            //TreeNew_AutoSizeColumn(context->TreeNewHandle, TREE_COLUMN_ITEM_DESCRIPTION, TN_AUTOSIZE_REMAINING_SPACE);
+
+            PhRegisterCallback(
+                PhGetGeneralCallback(GeneralCallbackProcessProviderUpdatedEvent),
+                EtPoolMonProcessesUpdatedCallback,
+                context,
+                &context->ProcessesUpdatedCallbackRegistration
+                );
+
+            PhInitializeWindowTheme(WindowHandle, !!PhGetIntegerSetting(SETTING_ENABLE_THEME_SUPPORT));
+
+            SendMessage(WindowHandle, WM_NEXTDLGCTL, (WPARAM)context->TreeNewHandle, TRUE);
+        }
+        break;
+    case WM_DESTROY:
+        {
+            PhRemoveWindowContext(WindowHandle, PH_WINDOW_CONTEXT_DEFAULT);
+
+            PhUnregisterCallback(PhGetGeneralCallback(GeneralCallbackProcessProviderUpdatedEvent), &context->ProcessesUpdatedCallbackRegistration);
+
+            PhSaveWindowPlacementToSetting(SETTING_NAME_POOL_WINDOW_POSITION, SETTING_NAME_POOL_WINDOW_SIZE, WindowHandle);
+
+            EtSaveSettingsPoolTagTreeList(context);
+
+            PhDeleteLayoutManager(&context->LayoutManager);
+            PhDeleteTreeNewFilterSupport(&context->FilterSupport);
+
+            EtDeletePoolTagTree(context);
+            EtFreePoolTagDatabase(context);
+
+            if (context->WindowFont) DeleteFont(context->WindowFont);
+
+            PhFree(context);
+
+            PostQuitMessage(0);
+        }
+        break;
+    case WM_SIZE:
+        {
+            PhLayoutManagerLayout(&context->LayoutManager);
+
+            if (context->TreeNewAutoSize)
+            {
+                TreeNew_AutoSizeColumn(context->TreeNewHandle, TREE_COLUMN_ITEM_DESCRIPTION, TN_AUTOSIZE_REMAINING_SPACE);
+            }
+        }
+        break;
+    case WM_DPICHANGED:
+        {
+            HFONT windowFont;
+
+            if (windowFont = PhCreateApplicationFont(PhGetWindowDpi(WindowHandle)))
+                PhSwapReferenceFont(&context->WindowFont, context->TreeNewHandle, windowFont, TRUE);
+
+            PhLayoutManagerUpdate(&context->LayoutManager, LOWORD(wParam));
+            PhLayoutManagerLayout(&context->LayoutManager);
+
+            if (context->TreeNewAutoSize)
+            {
+                TreeNew_AutoSizeColumn(context->TreeNewHandle, TREE_COLUMN_ITEM_DESCRIPTION, TN_AUTOSIZE_REMAINING_SPACE);
+            }
+        }
+        break;
+    case WM_PH_SHOW_DIALOG:
+        {
+            if (IsMinimized(WindowHandle))
+                ShowWindow(WindowHandle, SW_RESTORE);
+            else
+                ShowWindow(WindowHandle, SW_SHOW);
+
+            SetForegroundWindow(WindowHandle);
+        }
+        break;
+    case WM_COMMAND:
+        {
+            switch (GET_WM_COMMAND_ID(wParam, lParam))
+            {
+            case IDCANCEL:
+                DestroyWindow(WindowHandle);
+                break;
+            case IDC_POOLCLEAR:
+                {
+                    SetFocus(context->SearchboxHandle);
+                    Static_SetText(context->SearchboxHandle, L"");
+                }
+                break;
+            case IDC_POOLSEARCH:
+                NOTHING; // handled by search control callback
+                break;
+            case IDC_POOL_AUTOSIZE_COLUMNS:
+                {
+                    context->TreeNewAutoSize = !context->TreeNewAutoSize;
+                }
+                break;
+            case WM_PH_UPDATE_DIALOG:
+                {
+                    PPH_TREENEW_CONTEXT_MENU contextMenuEvent = (PPH_TREENEW_CONTEXT_MENU)lParam;
+                    PPH_EMENU menu;
+                    PPOOLTAG_ROOT_NODE selectedNode;
+                    PPH_EMENU_ITEM selectedItem;
+
+                    if (selectedNode = EtGetSelectedPoolTagNode(context))
+                    {
+                        menu = PhCreateEMenu();
+                        PhInsertEMenuItem(menu, PhCreateEMenuItem(0, 1, L"Show allocations", NULL, NULL), ULONG_MAX);
+                        PhInsertEMenuItem(menu, PhCreateEMenuSeparator(), ULONG_MAX);
+                        PhInsertEMenuItem(menu, PhCreateEMenuItem(0, 2, L"&Copy\bCtrl+C", NULL, NULL), ULONG_MAX);
+                        PhInsertCopyCellEMenuItem(menu, 2, context->TreeNewHandle, contextMenuEvent->Column);
+
+                        selectedItem = PhShowEMenu(
+                            menu,
+                            WindowHandle,
+                            PH_EMENU_SHOW_LEFTRIGHT,
+                            PH_ALIGN_LEFT | PH_ALIGN_TOP,
+                            contextMenuEvent->Location.x,
+                            contextMenuEvent->Location.y
+                            );
+
+                        if (selectedItem && selectedItem->Id != ULONG_MAX)
+                        {
+                            if (!PhHandleCopyCellEMenuItem(selectedItem))
+                            {
+                                switch (selectedItem->Id)
+                                {
+                                case 1:
+                                    EtShowBigPoolDialog(selectedNode->PoolItem);
+                                    break;
+                                case 2:
+                                    EtCopyPoolTagTree(context);
+                                    break;
+                                }
+                            }
+                        }
+
+                        PhDestroyEMenu(menu);
+                    }
+                }
+                break;
+            case WM_PH_SHOW_DIALOG:
+                {
+                    PPOOLTAG_ROOT_NODE selectedNode;
+
+                    if (selectedNode = EtGetSelectedPoolTagNode(context))
+                    {
+                        EtShowBigPoolDialog(selectedNode->PoolItem);
+                    }
+                }
+                break;
+            }
+        }
+        break;
+    case WM_KEYDOWN:
+        {
+        if (LOWORD(wParam) == 'K')
+            {
+                if (GetKeyState(VK_CONTROL) < 0)
+                {
+                    SetFocus(context->SearchboxHandle);
+                    return TRUE;
+                }
+            }
+        }
+        break;
+    case WM_CTLCOLORBTN:
+        return HANDLE_WM_CTLCOLORBTN(WindowHandle, wParam, lParam, PhWindowThemeControlColor);
+    case WM_CTLCOLORDLG:
+        return HANDLE_WM_CTLCOLORDLG(WindowHandle, wParam, lParam, PhWindowThemeControlColor);
+    case WM_CTLCOLORSTATIC:
+        return HANDLE_WM_CTLCOLORSTATIC(WindowHandle, wParam, lParam, PhWindowThemeControlColor);
+    }
+
+    return FALSE;
+}
+
+_Function_class_(USER_THREAD_START_ROUTINE)
+NTSTATUS EtShowPoolMonDialogThread(
+    _In_ PVOID Parameter
+    )
+{
+    BOOL result;
+    MSG message;
+    PH_AUTO_POOL autoPool;
+
+    PhInitializeAutoPool(&autoPool);
+
+    EtPoolTagDialogHandle = PhCreateDialog(
+        NtCurrentImageBase(),
+        MAKEINTRESOURCE(IDD_POOL),
+        NULL,
+        EtPoolMonDlgProc,
+        Parameter
+        );
+
+    PhSetEvent(&EtPoolTagDialogInitializedEvent);
+
+    PostMessage(EtPoolTagDialogHandle, WM_PH_SHOW_DIALOG, 0, 0);
+
+    while (result = GetMessage(&message, NULL, 0, 0))
+    {
+        if (result == INT_ERROR)
+            break;
+
+        if (!IsDialogMessage(EtPoolTagDialogHandle, &message))
+        {
+            TranslateMessage(&message);
+            DispatchMessage(&message);
+        }
+
+        PhDrainAutoPool(&autoPool);
+    }
+
+    PhDeleteAutoPool(&autoPool);
+
+    if (EtPoolTagDialogThreadHandle)
+    {
+        NtClose(EtPoolTagDialogThreadHandle);
+        EtPoolTagDialogThreadHandle = NULL;
+    }
+
+    PhResetEvent(&EtPoolTagDialogInitializedEvent);
+
+    return STATUS_SUCCESS;
+}
+
+VOID EtShowPoolTableDialog(
+    _In_ HWND ParentWindowHandle
+    )
+{
+    if (!EtPoolTagDialogThreadHandle)
+    {
+        if (!NT_SUCCESS(PhCreateThreadEx(&EtPoolTagDialogThreadHandle, EtShowPoolMonDialogThread, ParentWindowHandle)))
+        {
+            PhShowError2(ParentWindowHandle, L"Unable to create the window.", L"%s", L"");
+            return;
+        }
+
+        PhWaitForEvent(&EtPoolTagDialogInitializedEvent, NULL);
+    }
+
+    PostMessage(EtPoolTagDialogHandle, WM_PH_SHOW_DIALOG, 0, 0);
+}

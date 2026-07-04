@@ -1,0 +1,29 @@
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+
+  <PropertyGroup>
+    <TargetPlatforms Condition="'$(TargetPlatforms)' == ''">Win32;x64;ARM64</TargetPlatforms>
+    <TargetConfigurations Condition="'$(TargetConfigurations)' == ''">Debug;Release</TargetConfigurations>
+    <BuildAllTarget Condition="'$(BuildAllTarget)' == ''">Build</BuildAllTarget>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <TargetPlatformItem Include="$(TargetPlatforms)" />
+    <TargetConfigurationItem Include="$(TargetConfigurations)" />
+  </ItemGroup>
+
+  <Target Name="All">
+    <ItemGroup>
+      <_AllConfigPlatforms Include="@(TargetConfigurationItem)">
+        <Platform>%(TargetPlatformItem.Identity)</Platform>
+      </_AllConfigPlatforms>
+
+      <_ConfigPlatform Include="@(_AllConfigPlatforms)" />
+
+      <_ProjectsToBuild Include="$(MSBuildProjectFullPath)">
+        <AdditionalProperties>Configuration=%(_ConfigPlatform.Identity);Platform=%(_ConfigPlatform.Platform)</AdditionalProperties>
+      </_ProjectsToBuild>
+    </ItemGroup>
+
+    <MSBuild Projects="@(_ProjectsToBuild)" Targets="$(BuildAllTarget)" BuildInParallel="true" />
+  </Target>
+</Project>

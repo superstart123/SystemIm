@@ -1,0 +1,122 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="Current" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+
+    <!-- General -->
+    <PropertyGroup Label="Globals">
+        <OutDir>$(SystemInformerRoot)bin\$(Configuration)$(PlatformArchitecture)\plugins\</OutDir>
+        <IntDir>$(ProjectDir)obj\$(Configuration)$(PlatformArchitecture)\</IntDir>
+        <!-- Debugging -->
+        <LocalDebuggerCommand>$(SystemInformerRoot)bin\$(Configuration)$(PlatformArchitecture)\SystemInformer.exe</LocalDebuggerCommand>
+        <LocalDebuggerWorkingDirectory>$(SystemInformerRoot)bin\$(Configuration)$(PlatformArchitecture)\</LocalDebuggerWorkingDirectory>
+        <DebuggerFlavor>WindowsLocalDebugger</DebuggerFlavor>
+    </PropertyGroup>
+
+    <!-- Debug|Win32 Builds -->
+    <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
+        <ClCompile>
+            <AdditionalIncludeDirectories>$(SolutionDir)include;$(SystemInformerRoot)phnt\include;$(SystemInformerRoot)sdk\include\$(Configuration)$(PlatformArchitecture);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+            <PreprocessorDefinitions>WIN32;DEBUG;_DEBUG;_WINDOWS;_USRDLL;UNICODE;%(PreprocessorDefinitions);$(ExternalPreprocessorOptions)</PreprocessorDefinitions>
+        </ClCompile>
+        <Link>
+            <AdditionalLibraryDirectories>$(SystemInformerRoot)sdk\lib\$(Configuration)$(PlatformArchitecture);$(SystemInformerRoot)tools\thirdparty\bin\$(Configuration)$(PlatformArchitecture);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories> 
+            <AdditionalDependencies>SystemInformer.lib;thirdparty.lib;ntdll.lib;%(AdditionalDependencies)</AdditionalDependencies>
+        </Link>
+        <ResourceCompile>
+            <AdditionalIncludeDirectories>$(SolutionDir)include;$(SystemInformerRoot)phnt\include;$(SystemInformerRoot)sdk\include\$(Configuration)$(PlatformArchitecture);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+        </ResourceCompile>
+        <PostBuildEvent>
+            <Command>"$(SystemInformerRoot)build\build_zsign.cmd" "$(OutDir)$(TargetName)$(TargetExt)"</Command>
+        </PostBuildEvent>
+    </ItemDefinitionGroup>
+
+    <!-- Debug|x64 Builds -->
+    <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+        <ClCompile>
+            <AdditionalIncludeDirectories>$(SolutionDir)include;$(SystemInformerRoot)phnt\include;$(SystemInformerRoot)sdk\include\$(Configuration)$(PlatformArchitecture);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+            <PreprocessorDefinitions>WIN64;DEBUG;_DEBUG;_WINDOWS;_USRDLL;UNICODE;%(PreprocessorDefinitions);$(ExternalPreprocessorOptions)</PreprocessorDefinitions>
+        </ClCompile>
+        <Link>
+            <AdditionalLibraryDirectories>$(SystemInformerRoot)sdk\lib\$(Configuration)$(PlatformArchitecture);$(SystemInformerRoot)tools\thirdparty\bin\$(Configuration)$(PlatformArchitecture);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+            <AdditionalDependencies>SystemInformer.lib;thirdparty.lib;ntdll.lib;%(AdditionalDependencies)</AdditionalDependencies>
+        </Link>
+        <ResourceCompile>
+            <AdditionalIncludeDirectories>$(SolutionDir)include;$(SystemInformerRoot)phnt\include;$(SystemInformerRoot)sdk\include\$(Configuration)$(PlatformArchitecture);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+        </ResourceCompile>
+        <PostBuildEvent>
+            <Command>"$(SystemInformerRoot)build\build_zsign.cmd" "$(OutDir)$(TargetName)$(TargetExt)"</Command>
+        </PostBuildEvent>
+    </ItemDefinitionGroup>
+
+    <!-- Debug|ARM64 Builds -->
+    <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'">
+        <ClCompile>
+            <AdditionalIncludeDirectories>$(SolutionDir)include;$(SystemInformerRoot)phnt\include;$(SystemInformerRoot)sdk\include\$(Configuration)$(PlatformArchitecture);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+            <PreprocessorDefinitions>WIN64;DEBUG;_DEBUG;_WINDOWS;_USRDLL;UNICODE;%(PreprocessorDefinitions);$(ExternalPreprocessorOptions)</PreprocessorDefinitions>
+        </ClCompile>
+        <Link>
+            <AdditionalLibraryDirectories>$(SystemInformerRoot)sdk\lib\$(Configuration)$(PlatformArchitecture);$(SystemInformerRoot)tools\thirdparty\bin\$(Configuration)$(PlatformArchitecture);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+            <AdditionalDependencies>SystemInformer.lib;thirdparty.lib;ntdll.lib;%(AdditionalDependencies)</AdditionalDependencies>
+        </Link>
+        <ResourceCompile>
+            <AdditionalIncludeDirectories>$(SolutionDir)include;$(SystemInformerRoot)phnt\include;$(SystemInformerRoot)sdk\include\$(Configuration)$(PlatformArchitecture);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+        </ResourceCompile>
+        <PostBuildEvent>
+            <Command>"$(SystemInformerRoot)build\build_zsign.cmd" "$(OutDir)$(TargetName)$(TargetExt)"</Command>
+        </PostBuildEvent>
+    </ItemDefinitionGroup>
+
+    <!-- Release|Win32 Builds -->
+    <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
+        <ClCompile>
+            <AdditionalIncludeDirectories>$(SolutionDir)include;$(SystemInformerRoot)phnt\include;$(SystemInformerRoot)sdk\include\$(Configuration)$(PlatformArchitecture);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+            <PreprocessorDefinitions>WIN32;NDEBUG;_WINDOWS;_USRDLL;UNICODE;%(PreprocessorDefinitions);$(ExternalPreprocessorOptions)</PreprocessorDefinitions>
+        </ClCompile>
+        <Link>
+            <AdditionalLibraryDirectories>$(SystemInformerRoot)sdk\lib\$(Configuration)$(PlatformArchitecture);$(SystemInformerRoot)tools\thirdparty\bin\$(Configuration)$(PlatformArchitecture);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories> 
+            <AdditionalDependencies>SystemInformer.lib;thirdparty.lib;ntdll.lib;%(AdditionalDependencies)</AdditionalDependencies>
+        </Link>
+        <ResourceCompile>
+            <AdditionalIncludeDirectories>$(SolutionDir)include;$(SystemInformerRoot)phnt\include;$(SystemInformerRoot)sdk\include\$(Configuration)$(PlatformArchitecture);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+        </ResourceCompile>
+        <PostBuildEvent>
+            <Command>"$(SystemInformerRoot)build\build_zsign.cmd" "$(OutDir)$(TargetName)$(TargetExt)"</Command>
+        </PostBuildEvent>
+    </ItemDefinitionGroup>
+
+    <!-- Release|x64 Builds -->
+    <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+        <ClCompile>
+            <AdditionalIncludeDirectories>$(SolutionDir)include;$(SystemInformerRoot)phnt\include;$(SystemInformerRoot)sdk\include\$(Configuration)$(PlatformArchitecture);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+            <PreprocessorDefinitions>WIN64;NDEBUG;_WINDOWS;_USRDLL;UNICODE;%(PreprocessorDefinitions);$(ExternalPreprocessorOptions)</PreprocessorDefinitions>
+        </ClCompile>
+        <Link>
+            <AdditionalLibraryDirectories>$(SystemInformerRoot)sdk\lib\$(Configuration)$(PlatformArchitecture);$(SystemInformerRoot)tools\thirdparty\bin\$(Configuration)$(PlatformArchitecture);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+            <AdditionalDependencies>SystemInformer.lib;thirdparty.lib;ntdll.lib;%(AdditionalDependencies)</AdditionalDependencies>
+        </Link>
+        <ResourceCompile>
+            <AdditionalIncludeDirectories>$(SolutionDir)include;$(SystemInformerRoot)phnt\include;$(SystemInformerRoot)sdk\include\$(Configuration)$(PlatformArchitecture);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+        </ResourceCompile>
+        <PostBuildEvent>
+            <Command>"$(SystemInformerRoot)build\build_zsign.cmd" "$(OutDir)$(TargetName)$(TargetExt)"</Command>
+        </PostBuildEvent>
+    </ItemDefinitionGroup>
+
+    <!-- Release|ARM64 Builds -->
+    <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|ARM64'">
+        <ClCompile>
+            <AdditionalIncludeDirectories>$(SolutionDir)include;$(SystemInformerRoot)phnt\include;$(SystemInformerRoot)sdk\include\$(Configuration)$(PlatformArchitecture);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+            <PreprocessorDefinitions>WIN64;NDEBUG;_WINDOWS;_USRDLL;UNICODE;%(PreprocessorDefinitions);$(ExternalPreprocessorOptions)</PreprocessorDefinitions>
+        </ClCompile>
+        <Link>
+            <AdditionalLibraryDirectories>$(SystemInformerRoot)sdk\lib\$(Configuration)$(PlatformArchitecture);$(SystemInformerRoot)tools\thirdparty\bin\$(Configuration)$(PlatformArchitecture);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+            <AdditionalDependencies>SystemInformer.lib;thirdparty.lib;ntdll.lib;%(AdditionalDependencies)</AdditionalDependencies>
+        </Link>
+        <ResourceCompile>
+            <AdditionalIncludeDirectories>$(SolutionDir)include;$(SystemInformerRoot)phnt\include;$(SystemInformerRoot)sdk\include\$(Configuration)$(PlatformArchitecture);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+        </ResourceCompile>
+        <PostBuildEvent>
+            <Command>"$(SystemInformerRoot)build\build_zsign.cmd" "$(OutDir)$(TargetName)$(TargetExt)"</Command>
+        </PostBuildEvent>
+    </ItemDefinitionGroup>
+
+</Project>

@@ -1,0 +1,1538 @@
+/*
+ * Copyright (c) 2022 Winsider Seminars & Solutions, Inc.  All rights reserved.
+ *
+ * This file is part of System Informer.
+ *
+ * Authors:
+ *
+ *     dmex    2022-2024
+ *
+ */
+
+#include "devices.h"
+#include <devguid.h>
+
+PPH_OBJECT_TYPE GraphicsSysinfoEntryType = NULL;
+BOOLEAN GraphicsEnableAvxSupport = FALSE;
+
+_Function_class_(PH_GRAPH_MESSAGE_CALLBACK)
+BOOLEAN GraphicsDeviceGraphMessageCallback(
+    _In_ HWND WindowHandle,
+    _In_ ULONG Message,
+    _In_ PVOID Parameter1,
+    _In_ PVOID Parameter2,
+    _In_ PVOID Context
+    );
+
+PPH_STRING GraphicsDeviceGetAdapterDescription(
+    _In_ PPH_STRING DevicePath
+    )
+{
+    ULONG deviceIndex;
+    D3DKMT_HANDLE adapterHandle;
+    BOOLEAN npuDevice = FALSE;
+
+    if (NT_SUCCESS(GraphicsOpenAdapterFromDeviceName(&adapterHandle, NULL, PhGetString(DevicePath))))
+    {
+        GX_ADAPTER_ATTRIBUTES adapterAttributes;
+
+        if (NT_SUCCESS(GraphicsQueryAdapterAttributes(
+            adapterHandle,
+            &adapterAttributes
+            )))
+        {
+            npuDevice = !!adapterAttributes.TypeNpu;
+        }
+
+        GraphicsCloseAdapterHandle(adapterHandle);
+    }
+
+    if (GraphicsQueryDeviceInterfaceAdapterIndex(
+        PhGetString(DevicePath),
+        &deviceIndex
+        ))
+    {
+        SIZE_T returnLength;
+        PH_FORMAT format[2];
+        WCHAR formatBuffer[512];
+
+        PhInitFormatS(&format[0], npuDevice ? L"NPU " : L"GPU ");
+        PhInitFormatU(&format[1], deviceIndex);
+
+        if (PhFormatToBuffer(format, RTL_NUMBER_OF(format), formatBuffer, sizeof(formatBuffer), &returnLength))
+        {
+            PH_STRINGREF text;
+
+            text.Buffer = formatBuffer;
+            text.Length = returnLength - sizeof(UNICODE_NULL);
+
+            return PhCreateString2(&text);
+        }
+        else
+        {
+            return PhFormat(format, RTL_NUMBER_OF(format), 0);
+        }
+    }
+    else
+    {
+        return PhCreateString(npuDevice ? L"NPU" : L"GPU");
+    }
+}
+
+VOID GraphicsDeviceSysInfoInitializing(
+    _In_ PPH_PLUGIN_SYSINFO_POINTERS Pointers,
+    _In_ PDV_GPU_ENTRY DeviceEntry
+    )
+{
+    static PH_INITONCE initOnce = PH_INITONCE_INIT;
+    PDV_GPU_SYSINFO_CONTEXT context;
+    PH_SYSINFO_SECTION section;
+
+    if (PhBeginInitOnce(&initOnce))
+    {
+        GraphicsSysinfoEntryType = PhCreateObjectType(L"GpuSysInfoContext", 0, NULL);
+        PhEndInitOnce(&initOnce);
+    }
+
+    context = PhCreateObjectZero(sizeof(DV_GPU_SYSINFO_CONTEXT), GraphicsSysinfoEntryType);
+    PhInitializeEvent(&context->NodeWindowInitializedEvent);
+    context->DeviceEntry = PhReferenceObject(DeviceEntry);
+
+    memset(&section, 0, sizeof(PH_SYSINFO_SECTION));
+    section.Context = context;
+    section.Callback = GraphicsDeviceSectionCallback;
+    section.Name = PhGetStringRef(context->DeviceEntry->Id.DevicePath);
+
+    context->SysinfoSection = Pointers->CreateSection(&section);
+}
+
+VOID GraphicsDeviceInitializeDialog(
+    _In_ PDV_GPU_SYSINFO_CONTEXT Context
+    )
+{
+    PhInitializeGraphState(&Context->GpuGraphState);
+    PhInitializeGraphState(&Context->DedicatedGraphState);
+    PhInitializeGraphState(&Context->SharedGraphState);
+    PhInitializeGraphState(&Context->PowerUsageGraphState);
+    PhInitializeGraphState(&Context->TemperatureGraphState);
+    PhInitializeGraphState(&Context->FanRpmGraphState);
+}
+
+VOID GraphicsDeviceUninitializeDialog(
+    _In_ PDV_GPU_SYSINFO_CONTEXT Context
+    )
+{
+    PhDeleteGraphState(&Context->GpuGraphState);
+    PhDeleteGraphState(&Context->DedicatedGraphState);
+    PhDeleteGraphState(&Context->SharedGraphState);
+    PhDeleteGraphState(&Context->PowerUsageGraphState);
+    PhDeleteGraphState(&Context->TemperatureGraphState);
+    PhDeleteGraphState(&Context->FanRpmGraphState);
+}
+
+VOID GraphicsDeviceInitializeDialogDpi(
+    _In_ PDV_GPU_SYSINFO_CONTEXT Context
+    )
+{
+    Context->SysInfoGraphPadding = PhScaleToDisplay(GPU_GRAPH_PADDING, Context->SysinfoSection->Parameters->WindowDpi);
+}
+
+VOID GraphicsDeviceTickDialog(
+    _In_ PDV_GPU_SYSINFO_CONTEXT Context
+    )
+{
+    GraphicsDeviceUpdateGraphs(Context);
+    GraphicsDeviceUpdatePanel(Context);
+}
+
+VOID GraphicsDeviceCreateGraphs(
+    _In_ PDV_GPU_SYSINFO_CONTEXT Context
+    )
+{
+    PH_GRAPH_CREATEPARAMS graphCreateParams;
+
+    memset(&graphCreateParams, 0, sizeof(PH_GRAPH_CREATEPARAMS));
+    graphCreateParams.Size = sizeof(PH_GRAPH_CREATEPARAMS);
+    graphCreateParams.Callback = GraphicsDeviceGraphMessageCallback;
+    graphCreateParams.Context = Context;
+
+    Context->GpuGraphHandle = PhCreateWindow(
+        PH_GRAPH_CLASSNAME,
+        NULL,
+        WS_VISIBLE | WS_CHILD | WS_BORDER,
+        0,
+        0,
+        0,
+        0,
+        Context->GpuDialog,
+        NULL,
+        NULL,
+        &graphCreateParams
+        );
+    Graph_SetTooltip(Context->GpuGraphHandle, TRUE);
+
+    Context->DedicatedGraphHandle = PhCreateWindow(
+        PH_GRAPH_CLASSNAME,
+        NULL,
+        WS_VISIBLE | WS_CHILD | WS_BORDER,
+        0,
+        0,
+        0,
+        0,
+        Context->GpuDialog,
+        NULL,
+        NULL,
+        &graphCreateParams
+        );
+    Graph_SetTooltip(Context->DedicatedGraphHandle, TRUE);
+
+    Context->SharedGraphHandle = PhCreateWindow(
+        PH_GRAPH_CLASSNAME,
+        NULL,
+        WS_VISIBLE | WS_CHILD | WS_BORDER,
+        0,
+        0,
+        0,
+        0,
+        Context->GpuDialog,
+        NULL,
+        NULL,
+        &graphCreateParams
+        );
+    Graph_SetTooltip(Context->SharedGraphHandle, TRUE);
+
+    //if (Context->EtGpuSupported)
+    {
+        Context->PowerUsageGraphHandle = PhCreateWindow(
+            PH_GRAPH_CLASSNAME,
+            NULL,
+            WS_VISIBLE | WS_CHILD | WS_BORDER,
+            0,
+            0,
+            0,
+            0,
+            Context->GpuDialog,
+            NULL,
+            NULL,
+            &graphCreateParams
+            );
+        Graph_SetTooltip(Context->PowerUsageGraphHandle, TRUE);
+
+        Context->TemperatureGraphHandle = PhCreateWindow(
+            PH_GRAPH_CLASSNAME,
+            NULL,
+            WS_VISIBLE | WS_CHILD | WS_BORDER,
+            0,
+            0,
+            0,
+            0,
+            Context->GpuDialog,
+            NULL,
+            NULL,
+            &graphCreateParams
+            );
+        Graph_SetTooltip(Context->TemperatureGraphHandle, TRUE);
+
+        Context->FanRpmGraphHandle = PhCreateWindow(
+            PH_GRAPH_CLASSNAME,
+            NULL,
+            WS_VISIBLE | WS_CHILD | WS_BORDER,
+            0,
+            0,
+            0,
+            0,
+            Context->GpuDialog,
+            NULL,
+            NULL,
+            &graphCreateParams
+            );
+        Graph_SetTooltip(Context->FanRpmGraphHandle, TRUE);
+    }
+}
+
+VOID GraphicsDeviceLayoutGraphs(
+    _In_ PDV_GPU_SYSINFO_CONTEXT Context
+    )
+{
+    RECT clientRect;
+    RECT labelRect;
+    RECT marginRect;
+    ULONG graphWidth;
+    ULONG graphHeight;
+    HDWP deferHandle;
+    ULONG y;
+
+    Context->GpuGraphState.Valid = FALSE;
+    Context->GpuGraphState.TooltipIndex = ULONG_MAX;
+    Context->DedicatedGraphState.Valid = FALSE;
+    Context->DedicatedGraphState.TooltipIndex = ULONG_MAX;
+    Context->SharedGraphState.Valid = FALSE;
+    Context->SharedGraphState.TooltipIndex = ULONG_MAX;
+
+    //if (EtGpuSupported)
+    {
+        Context->PowerUsageGraphState.Valid = FALSE;
+        Context->PowerUsageGraphState.TooltipIndex = ULONG_MAX;
+        Context->TemperatureGraphState.Valid = FALSE;
+        Context->TemperatureGraphState.TooltipIndex = ULONG_MAX;
+        Context->FanRpmGraphState.Valid = FALSE;
+        Context->FanRpmGraphState.TooltipIndex = ULONG_MAX;
+    }
+
+    marginRect = Context->GpuGraphMarginScaled;
+
+    PhGetClientRect(Context->GpuDialog, &clientRect);
+    PhGetClientRect(GetDlgItem(Context->GpuDialog, IDC_GPU_L), &labelRect);
+    graphWidth = clientRect.right - marginRect.left - marginRect.right;
+
+    //if (EtGpuSupported)
+        graphHeight = (clientRect.bottom - marginRect.top - marginRect.bottom - labelRect.bottom * 6 - Context->SysInfoGraphPadding * 8) / 6;
+    //else
+    //    graphHeight = (clientRect.bottom - marginRect.top - marginRect.bottom - labelRect.bottom * 3 - ET_GPU_PADDING * 5) / 3;
+
+    deferHandle = BeginDeferWindowPos(12);
+    y = marginRect.top;
+
+    deferHandle = DeferWindowPos(
+        deferHandle,
+        GetDlgItem(Context->GpuDialog, IDC_GPU_L),
+        NULL,
+        marginRect.left,
+        y,
+        0,
+        0,
+        SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER
+        );
+    y += labelRect.bottom + Context->SysInfoGraphPadding;
+
+    deferHandle = DeferWindowPos(
+        deferHandle,
+        Context->GpuGraphHandle,
+        NULL,
+        marginRect.left,
+        y,
+        graphWidth,
+        graphHeight,
+        SWP_NOACTIVATE | SWP_NOZORDER
+        );
+    y += graphHeight + Context->SysInfoGraphPadding;
+
+    deferHandle = DeferWindowPos(
+        deferHandle,
+        GetDlgItem(Context->GpuDialog, IDC_DEDICATED_L),
+        NULL,
+        marginRect.left,
+        y,
+        0,
+        0,
+        SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER
+        );
+    y += labelRect.bottom + Context->SysInfoGraphPadding;
+
+    deferHandle = DeferWindowPos(
+        deferHandle,
+        Context->DedicatedGraphHandle,
+        NULL,
+        marginRect.left,
+        y,
+        graphWidth,
+        graphHeight,
+        SWP_NOACTIVATE | SWP_NOZORDER
+        );
+    y += graphHeight + Context->SysInfoGraphPadding;
+
+    deferHandle = DeferWindowPos(
+        deferHandle,
+        GetDlgItem(Context->GpuDialog, IDC_SHARED_L),
+        NULL,
+        marginRect.left,
+        y,
+        0,
+        0,
+        SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER
+        );
+    y += labelRect.bottom + Context->SysInfoGraphPadding;
+
+    deferHandle = DeferWindowPos(
+        deferHandle,
+        Context->SharedGraphHandle,
+        NULL,
+        marginRect.left,
+        y,
+        graphWidth,
+        graphHeight,
+        SWP_NOACTIVATE | SWP_NOZORDER
+        );
+    y += graphHeight + Context->SysInfoGraphPadding;
+
+    //if (EtGpuSupported)
+    {
+        deferHandle = DeferWindowPos(
+            deferHandle,
+            GetDlgItem(Context->GpuDialog, IDC_POWER_USAGE_L),
+            NULL,
+            marginRect.left,
+            y,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER
+            );
+        y += labelRect.bottom + Context->SysInfoGraphPadding;
+
+        deferHandle = DeferWindowPos(
+            deferHandle,
+            Context->PowerUsageGraphHandle,
+            NULL,
+            marginRect.left,
+            y,
+            graphWidth,
+            graphHeight,
+            SWP_NOACTIVATE | SWP_NOZORDER
+            );
+        y += graphHeight + Context->SysInfoGraphPadding;
+
+        deferHandle = DeferWindowPos(
+            deferHandle,
+            GetDlgItem(Context->GpuDialog, IDC_TEMPERATURE_L),
+            NULL,
+            marginRect.left,
+            y,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER
+            );
+        y += labelRect.bottom + Context->SysInfoGraphPadding;
+
+        deferHandle = DeferWindowPos(
+            deferHandle,
+            Context->TemperatureGraphHandle,
+            NULL,
+            marginRect.left,
+            y,
+            graphWidth,
+            graphHeight,
+            SWP_NOACTIVATE | SWP_NOZORDER
+            );
+        y += graphHeight + Context->SysInfoGraphPadding;
+
+        deferHandle = DeferWindowPos(
+            deferHandle,
+            GetDlgItem(Context->GpuDialog, IDC_FAN_RPM_L),
+            NULL,
+            marginRect.left,
+            y,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER
+            );
+        y += labelRect.bottom + Context->SysInfoGraphPadding;
+
+        deferHandle = DeferWindowPos(
+            deferHandle,
+            Context->FanRpmGraphHandle,
+            NULL,
+            marginRect.left,
+            y,
+            graphWidth,
+            clientRect.bottom - marginRect.bottom - y,
+            SWP_NOACTIVATE | SWP_NOZORDER
+            );
+    }
+
+    EndDeferWindowPos(deferHandle);
+}
+
+VOID GraphicsDeviceNotifyGpuGraph(
+    _In_ PDV_GPU_SYSINFO_CONTEXT Context,
+    _In_ NMHDR *Header
+    )
+{
+    switch (Header->code)
+    {
+    case GCN_GETDRAWINFO:
+        {
+            PPH_GRAPH_GETDRAWINFO getDrawInfo = (PPH_GRAPH_GETDRAWINFO)Header;
+            PPH_GRAPH_DRAW_INFO drawInfo = getDrawInfo->DrawInfo;
+
+            drawInfo->Flags = PH_GRAPH_USE_GRID_X | PH_GRAPH_USE_GRID_Y | (GraphicsEnableScaleText ? PH_GRAPH_LABEL_MAX_Y : 0);
+            Context->SysinfoSection->Parameters->ColorSetupFunction(drawInfo, PhGetIntegerSetting(SETTING_COLOR_CPU_KERNEL), 0, Context->SysinfoSection->Parameters->WindowDpi);
+
+            PhGraphStateGetDrawInfo(
+                &Context->GpuGraphState,
+                getDrawInfo,
+                Context->DeviceEntry->GpuUsageHistory.Count
+                );
+
+            if (!Context->GpuGraphState.Valid)
+            {
+                PhCopyCircularBuffer_FLOAT(&Context->DeviceEntry->GpuUsageHistory, Context->GpuGraphState.Data1, drawInfo->LineDataCount);
+
+                if (GraphicsEnableScaleGraph)
+                {
+                    FLOAT max = 0;
+
+                    for (ULONG i = 0; i < drawInfo->LineDataCount; i++)
+                    {
+                        FLOAT data = Context->GpuGraphState.Data1[i];
+
+                        if (max < data)
+                            max = data;
+                    }
+
+                    if (max != 0)
+                    {
+                        PhDivideSinglesBySingle(Context->GpuGraphState.Data1, max, drawInfo->LineDataCount);
+                    }
+
+                    if (GraphicsEnableScaleText)
+                    {
+                        drawInfo->LabelYFunction = PhSiDoubleLabelYFunction;
+                        drawInfo->LabelYFunctionParameter = max;
+                    }
+                }
+                else
+                {
+                    if (GraphicsEnableScaleText)
+                    {
+                        drawInfo->LabelYFunction = PhSiDoubleLabelYFunction;
+                        drawInfo->LabelYFunctionParameter = 1.0f;
+                    }
+                }
+
+                Context->GpuGraphState.Valid = TRUE;
+            }
+        }
+        break;
+    case GCN_GETTOOLTIPTEXT:
+        {
+            PPH_GRAPH_GETTOOLTIPTEXT getTooltipText = (PPH_GRAPH_GETTOOLTIPTEXT)Header;
+
+            if (getTooltipText->Index < getTooltipText->TotalCount)
+            {
+                if (Context->GpuGraphState.TooltipIndex != getTooltipText->Index)
+                {
+                    FLOAT gpu;
+                    PH_FORMAT format[3];
+
+                    gpu = PhGetItemCircularBuffer_FLOAT(&Context->DeviceEntry->GpuUsageHistory, getTooltipText->Index);
+
+                    // %.2f%%%s\n%s
+                    PhInitFormatF(&format[0], gpu * 100, 2);
+                    PhInitFormatS(&format[1], L"%\n");
+                    PhInitFormatSR(&format[2], PH_AUTO_T(PH_STRING, PhGetStatisticsTimeString(NULL, getTooltipText->Index))->sr);
+
+                    PhMoveReference(&Context->GpuGraphState.TooltipText, PhFormat(format, RTL_NUMBER_OF(format), 0));
+                }
+
+                getTooltipText->Text = PhGetStringRef(Context->GpuGraphState.TooltipText);
+            }
+        }
+        break;
+    }
+}
+
+VOID GraphicsDeviceNotifyDedicatedGraph(
+    _In_ PDV_GPU_SYSINFO_CONTEXT Context,
+    _In_ NMHDR *Header
+    )
+{
+    switch (Header->code)
+    {
+    case GCN_GETDRAWINFO:
+        {
+            PPH_GRAPH_GETDRAWINFO getDrawInfo = (PPH_GRAPH_GETDRAWINFO)Header;
+            PPH_GRAPH_DRAW_INFO drawInfo = getDrawInfo->DrawInfo;
+            ULONG i;
+
+            drawInfo->Flags = PH_GRAPH_USE_GRID_X | PH_GRAPH_USE_GRID_Y | (GraphicsEnableScaleText ? PH_GRAPH_LABEL_MAX_Y : 0);
+            Context->SysinfoSection->Parameters->ColorSetupFunction(drawInfo, PhGetIntegerSetting(SETTING_COLOR_PRIVATE), 0, Context->SysinfoSection->Parameters->WindowDpi);
+
+            PhGraphStateGetDrawInfo(
+                &Context->DedicatedGraphState,
+                getDrawInfo,
+                Context->DeviceEntry->DedicatedHistory.Count
+                );
+
+            if (!Context->DedicatedGraphState.Valid)
+            {
+                FLOAT max = 0;
+
+                if (Context->DeviceEntry->DedicatedLimit != 0 && !GraphicsEnableScaleGraph)
+                {
+                    max = (FLOAT)Context->DeviceEntry->DedicatedLimit;
+                }
+
+                for (i = 0; i < drawInfo->LineDataCount; i++)
+                {
+                    FLOAT data = Context->DedicatedGraphState.Data1[i] = (FLOAT)PhGetItemCircularBuffer_ULONG64(&Context->DeviceEntry->DedicatedHistory, i);
+
+                    if (max < data)
+                        max = data;
+                }
+
+                if (max != 0)
+                {
+                    PhDivideSinglesBySingle(Context->DedicatedGraphState.Data1, max, drawInfo->LineDataCount);
+                }
+
+                if (GraphicsEnableScaleText)
+                {
+                    drawInfo->LabelYFunction = PhSiSizeLabelYFunction;
+                    drawInfo->LabelYFunctionParameter = max;
+                }
+
+                Context->DedicatedGraphState.Valid = TRUE;
+            }
+        }
+        break;
+    case GCN_GETTOOLTIPTEXT:
+        {
+            PPH_GRAPH_GETTOOLTIPTEXT getTooltipText = (PPH_GRAPH_GETTOOLTIPTEXT)Header;
+
+            if (getTooltipText->Index < getTooltipText->TotalCount)
+            {
+                if (Context->DedicatedGraphState.TooltipIndex != getTooltipText->Index)
+                {
+                    ULONG64 usedPages;
+                    PH_FORMAT format[3];
+
+                    usedPages = PhGetItemCircularBuffer_ULONG64(&Context->DeviceEntry->DedicatedHistory, getTooltipText->Index);
+
+                    // Dedicated Memory: %s\n%s
+                    PhInitFormatSize(&format[0], usedPages);
+                    PhInitFormatC(&format[1], L'\n');
+                    PhInitFormatSR(&format[2], PH_AUTO_T(PH_STRING, PhGetStatisticsTimeString(NULL, getTooltipText->Index))->sr);
+
+                    PhMoveReference(&Context->DedicatedGraphState.TooltipText, PhFormat(format, RTL_NUMBER_OF(format), 0));
+                }
+
+                getTooltipText->Text = PhGetStringRef(Context->DedicatedGraphState.TooltipText);
+            }
+        }
+        break;
+    }
+}
+
+VOID GraphicsDeviceNotifySharedGraph(
+    _In_ PDV_GPU_SYSINFO_CONTEXT Context,
+    _In_ NMHDR *Header
+    )
+{
+    switch (Header->code)
+    {
+    case GCN_GETDRAWINFO:
+        {
+            PPH_GRAPH_GETDRAWINFO getDrawInfo = (PPH_GRAPH_GETDRAWINFO)Header;
+            PPH_GRAPH_DRAW_INFO drawInfo = getDrawInfo->DrawInfo;
+            ULONG i;
+
+            drawInfo->Flags = PH_GRAPH_USE_GRID_X | PH_GRAPH_USE_GRID_Y | PH_GRAPH_USE_LINE_2 | (GraphicsEnableScaleText ? PH_GRAPH_LABEL_MAX_Y : 0);
+            Context->SysinfoSection->Parameters->ColorSetupFunction(drawInfo, PhGetIntegerSetting(SETTING_COLOR_PHYSICAL), PhGetIntegerSetting(SETTING_COLOR_CPU_KERNEL), Context->SysinfoSection->Parameters->WindowDpi);
+
+            PhGraphStateGetDrawInfo(
+                &Context->SharedGraphState,
+                getDrawInfo,
+                Context->DeviceEntry->CommitHistory.Count
+                );
+
+            if (!Context->SharedGraphState.Valid)
+            {
+                FLOAT max = 1024 * 1024;
+
+                for (i = 0; i < drawInfo->LineDataCount; i++)
+                {
+                    FLOAT data1 = Context->SharedGraphState.Data1[i] = (FLOAT)PhGetItemCircularBuffer_ULONG64(&Context->DeviceEntry->SharedHistory, i);
+                    FLOAT data2 = Context->SharedGraphState.Data2[i] = (FLOAT)PhGetItemCircularBuffer_ULONG64(&Context->DeviceEntry->CommitHistory, i);
+
+                    if (max < data1)
+                        max = data1;
+                    if (max < data2)
+                        max = data2;
+                }
+
+                max = max * 2;
+
+                if (max != 0)
+                {
+                    PhDivideSinglesBySingle(Context->SharedGraphState.Data1, max, drawInfo->LineDataCount);
+                    PhDivideSinglesBySingle(Context->SharedGraphState.Data2, max, drawInfo->LineDataCount);
+                }
+
+                if (GraphicsEnableScaleText)
+                {
+                    drawInfo->LabelYFunction = PhSiSizeLabelYFunction;
+                    drawInfo->LabelYFunctionParameter = max;
+                }
+
+                Context->SharedGraphState.Valid = TRUE;
+            }
+        }
+        break;
+    case GCN_GETTOOLTIPTEXT:
+        {
+            PPH_GRAPH_GETTOOLTIPTEXT getTooltipText = (PPH_GRAPH_GETTOOLTIPTEXT)Header;
+
+            if (getTooltipText->Index < getTooltipText->TotalCount)
+            {
+                if (Context->SharedGraphState.TooltipIndex != getTooltipText->Index)
+                {
+                    ULONG64 shared;
+                    ULONG64 commit;
+                    PH_FORMAT format[8];
+
+                    shared = PhGetItemCircularBuffer_ULONG64(&Context->DeviceEntry->SharedHistory, getTooltipText->Index);
+                    commit = PhGetItemCircularBuffer_ULONG64(&Context->DeviceEntry->CommitHistory, getTooltipText->Index);
+
+                    // Shared Memory: %s\n%s
+                    PhInitFormatS(&format[0], L"Shared: ");
+                    PhInitFormatSize(&format[1], shared);
+                    PhInitFormatS(&format[2], L"\nCommit: ");
+                    PhInitFormatSize(&format[3], commit);
+                    PhInitFormatS(&format[4], L"\nTotal: ");
+                    PhInitFormatSize(&format[5], shared + commit);
+                    PhInitFormatC(&format[6], L'\n');
+                    PhInitFormatSR(&format[7], PH_AUTO_T(PH_STRING, PhGetStatisticsTimeString(NULL, getTooltipText->Index))->sr);
+
+                    PhMoveReference(&Context->SharedGraphState.TooltipText, PhFormat(format, RTL_NUMBER_OF(format), 0));
+                }
+
+                getTooltipText->Text = PhGetStringRef(Context->SharedGraphState.TooltipText);
+            }
+        }
+        break;
+    }
+}
+
+PPH_STRING GraphicsDevicePowerLabelYFunction(
+    _In_ PPH_GRAPH_DRAW_INFO DrawInfo,
+    _In_ ULONG DataIndex,
+    _In_ FLOAT Value,
+    _In_ FLOAT Parameter
+    )
+{
+    PH_FORMAT format[2];
+
+    PhInitFormatF(&format[0], Value * Parameter, 1);
+    PhInitFormatC(&format[1], L'%');
+
+    return PhFormat(format, RTL_NUMBER_OF(format), 0);
+}
+
+VOID GraphicsDeviceNotifyPowerUsageGraph(
+    _In_ PDV_GPU_SYSINFO_CONTEXT Context,
+    _In_ NMHDR* Header
+    )
+{
+    switch (Header->code)
+    {
+    case GCN_GETDRAWINFO:
+        {
+            PPH_GRAPH_GETDRAWINFO getDrawInfo = (PPH_GRAPH_GETDRAWINFO)Header;
+            PPH_GRAPH_DRAW_INFO drawInfo = getDrawInfo->DrawInfo;
+            ULONG i;
+
+            drawInfo->Flags = PH_GRAPH_USE_GRID_X | PH_GRAPH_USE_GRID_Y | (GraphicsEnableScaleText ? PH_GRAPH_LABEL_MAX_Y : 0);
+            Context->SysinfoSection->Parameters->ColorSetupFunction(drawInfo, PhGetIntegerSetting(SETTING_COLOR_POWER_USAGE), 0, Context->SysinfoSection->Parameters->WindowDpi);
+
+            PhGraphStateGetDrawInfo(
+                &Context->PowerUsageGraphState,
+                getDrawInfo,
+                Context->DeviceEntry->PowerHistory.Count
+                );
+
+            if (!Context->PowerUsageGraphState.Valid)
+            {
+                FLOAT max = 100.0f;
+
+                for (i = 0; i < drawInfo->LineDataCount; i++)
+                {
+                    FLOAT data = Context->PowerUsageGraphState.Data1[i] = PhGetItemCircularBuffer_FLOAT(&Context->DeviceEntry->PowerHistory, i);
+
+                    if (max < data)
+                        max = data;
+                }
+
+                if (max != 0)
+                {
+                    PhDivideSinglesBySingle(Context->PowerUsageGraphState.Data1, max, drawInfo->LineDataCount);
+                }
+
+                if (GraphicsEnableScaleText)
+                {
+                    drawInfo->LabelYFunction = GraphicsDevicePowerLabelYFunction;
+                    drawInfo->LabelYFunctionParameter = max;
+                }
+
+                Context->PowerUsageGraphState.Valid = TRUE;
+            }
+        }
+        break;
+    case GCN_GETTOOLTIPTEXT:
+        {
+            PPH_GRAPH_GETTOOLTIPTEXT getTooltipText = (PPH_GRAPH_GETTOOLTIPTEXT)Header;
+
+            if (getTooltipText->Index < getTooltipText->TotalCount)
+            {
+                if (Context->PowerUsageGraphState.TooltipIndex != getTooltipText->Index)
+                {
+                    FLOAT powerUsage;
+                    PH_FORMAT format[4];
+
+                    powerUsage = PhGetItemCircularBuffer_FLOAT(&Context->DeviceEntry->PowerHistory, getTooltipText->Index);
+
+                    PhInitFormatF(&format[0], powerUsage, 1);
+                    PhInitFormatC(&format[1], L'%');
+                    PhInitFormatC(&format[2], L'\n');
+                    PhInitFormatSR(&format[3], PH_AUTO_T(PH_STRING, PhGetStatisticsTimeString(NULL, getTooltipText->Index))->sr);
+
+                    PhMoveReference(&Context->PowerUsageGraphState.TooltipText, PhFormat(format, RTL_NUMBER_OF(format), 0));
+                }
+
+                getTooltipText->Text = PhGetStringRef(Context->PowerUsageGraphState.TooltipText);
+            }
+        }
+        break;
+    }
+}
+
+PPH_STRING GraphicsDeviceTemperatureLabelYFunction(
+    _In_ PPH_GRAPH_DRAW_INFO DrawInfo,
+    _In_ ULONG DataIndex,
+    _In_ FLOAT Value,
+    _In_ FLOAT Parameter
+    )
+{
+    PH_FORMAT format[2];
+
+    PhInitFormatF(&format[0], Value * Parameter, 1);
+    PhInitFormatS(&format[1], L"\u00b0C\n");
+
+    return PhFormat(format, RTL_NUMBER_OF(format), 0);
+}
+
+VOID GraphicsDeviceNotifyTemperatureGraph(
+    _In_ PDV_GPU_SYSINFO_CONTEXT Context,
+    _In_ NMHDR* Header
+    )
+{
+    switch (Header->code)
+    {
+    case GCN_GETDRAWINFO:
+        {
+            PPH_GRAPH_GETDRAWINFO getDrawInfo = (PPH_GRAPH_GETDRAWINFO)Header;
+            PPH_GRAPH_DRAW_INFO drawInfo = getDrawInfo->DrawInfo;
+            ULONG i;
+
+            drawInfo->Flags = PH_GRAPH_USE_GRID_X | PH_GRAPH_USE_GRID_Y | (GraphicsEnableScaleText ? PH_GRAPH_LABEL_MAX_Y : 0);
+            Context->SysinfoSection->Parameters->ColorSetupFunction(drawInfo, PhGetIntegerSetting(SETTING_COLOR_TEMPERATURE), 0, Context->SysinfoSection->Parameters->WindowDpi);
+
+            PhGraphStateGetDrawInfo(
+                &Context->TemperatureGraphState,
+                getDrawInfo,
+                Context->DeviceEntry->TemperatureHistory.Count
+                );
+
+            if (!Context->TemperatureGraphState.Valid)
+            {
+                FLOAT max = 100.0f;
+
+                for (i = 0; i < drawInfo->LineDataCount; i++)
+                {
+                    FLOAT data = Context->TemperatureGraphState.Data1[i] = PhGetItemCircularBuffer_FLOAT(&Context->DeviceEntry->TemperatureHistory, i);
+
+                    if (max < data)
+                        max = data;
+                }
+
+                if (max != 0)
+                {
+                    PhDivideSinglesBySingle(Context->TemperatureGraphState.Data1, max, drawInfo->LineDataCount);
+                }
+
+                if (GraphicsEnableScaleText)
+                {
+                    drawInfo->LabelYFunction = GraphicsDeviceTemperatureLabelYFunction;
+                    drawInfo->LabelYFunctionParameter = max;
+                }
+
+                Context->TemperatureGraphState.Valid = TRUE;
+            }
+        }
+        break;
+    case GCN_GETTOOLTIPTEXT:
+        {
+            PPH_GRAPH_GETTOOLTIPTEXT getTooltipText = (PPH_GRAPH_GETTOOLTIPTEXT)Header;
+
+            if (getTooltipText->Index < getTooltipText->TotalCount)
+            {
+                if (Context->TemperatureGraphState.TooltipIndex != getTooltipText->Index)
+                {
+                    FLOAT temp;
+                    PH_FORMAT format[3];
+
+                    temp = PhGetItemCircularBuffer_FLOAT(&Context->DeviceEntry->TemperatureHistory, getTooltipText->Index);
+
+                    //if (PhGetIntegerSetting(SETTING_NAME_ENABLE_FAHRENHEIT))
+                    //{
+                    //    PhInitFormatF(&format[0], (temp * 1.8 + 32), 1);
+                    //    PhInitFormatS(&format[1], L"\u00b0F\n");
+                    //    PhInitFormatSR(&format[2], PH_AUTO_T(PH_STRING, PhGetStatisticsTimeString(NULL, getTooltipText->Index))->sr);
+                    //}
+                    //else
+                    {
+                        PhInitFormatF(&format[0], temp, 1);
+                        PhInitFormatS(&format[1], L"\u00b0C\n");
+                        PhInitFormatSR(&format[2], PH_AUTO_T(PH_STRING, PhGetStatisticsTimeString(NULL, getTooltipText->Index))->sr);
+                    }
+
+                    PhMoveReference(&Context->TemperatureGraphState.TooltipText, PhFormat(format, RTL_NUMBER_OF(format), 0));
+                }
+
+                getTooltipText->Text = PhGetStringRef(Context->TemperatureGraphState.TooltipText);
+            }
+        }
+        break;
+    }
+}
+
+PPH_STRING GraphicsDeviceFanLabelYFunction(
+    _In_ PPH_GRAPH_DRAW_INFO DrawInfo,
+    _In_ ULONG DataIndex,
+    _In_ FLOAT Value,
+    _In_ FLOAT Parameter
+    )
+{
+    PH_FORMAT format[2];
+
+    PhInitFormatU(&format[0], (ULONG)(Value * Parameter));
+    PhInitFormatS(&format[1], L" RPM\n");
+
+    return PhFormat(format, RTL_NUMBER_OF(format), 0);
+}
+
+VOID GraphicsDeviceNotifyFanRpmGraph(
+    _In_ PDV_GPU_SYSINFO_CONTEXT Context,
+    _In_ NMHDR* Header
+    )
+{
+    switch (Header->code)
+    {
+    case GCN_GETDRAWINFO:
+        {
+            PPH_GRAPH_GETDRAWINFO getDrawInfo = (PPH_GRAPH_GETDRAWINFO)Header;
+            PPH_GRAPH_DRAW_INFO drawInfo = getDrawInfo->DrawInfo;
+            ULONG i;
+
+            drawInfo->Flags = PH_GRAPH_USE_GRID_X | PH_GRAPH_USE_GRID_Y | (GraphicsEnableScaleText ? PH_GRAPH_LABEL_MAX_Y : 0);
+            Context->SysinfoSection->Parameters->ColorSetupFunction(drawInfo, PhGetIntegerSetting(SETTING_COLOR_FAN_RPM), 0, Context->SysinfoSection->Parameters->WindowDpi);
+
+            PhGraphStateGetDrawInfo(
+                &Context->FanRpmGraphState,
+                getDrawInfo,
+                Context->DeviceEntry->FanHistory.Count
+                );
+
+            if (!Context->FanRpmGraphState.Valid)
+            {
+                FLOAT max = 1000.0f;
+
+                if (GraphicsEnableAvxSupport && drawInfo->LineDataCount > 128)
+                {
+                    FLOAT data;
+
+                    PhCopyConvertCircularBufferULONG(
+                        &Context->DeviceEntry->FanHistory,
+                        Context->FanRpmGraphState.Data1,
+                        drawInfo->LineDataCount
+                        );
+
+                    data = PhMaxMemorySingles(
+                        Context->FanRpmGraphState.Data1,
+                        drawInfo->LineDataCount
+                        );
+
+                    if (max < data)
+                        max = data;
+                }
+                else
+                {
+                    for (i = 0; i < drawInfo->LineDataCount; i++)
+                    {
+                        FLOAT data = Context->FanRpmGraphState.Data1[i] = (FLOAT)PhGetItemCircularBuffer_ULONG(&Context->DeviceEntry->FanHistory, i);
+
+                        if (max < data)
+                            max = data;
+                    }
+                }
+
+                if (max != 0)
+                {
+                    PhDivideSinglesBySingle(Context->FanRpmGraphState.Data1, max, drawInfo->LineDataCount);
+                }
+
+                if (GraphicsEnableScaleText)
+                {
+                    drawInfo->LabelYFunction = GraphicsDeviceFanLabelYFunction;
+                    drawInfo->LabelYFunctionParameter = max;
+                }
+
+                Context->FanRpmGraphState.Valid = TRUE;
+            }
+        }
+        break;
+    case GCN_GETTOOLTIPTEXT:
+        {
+            PPH_GRAPH_GETTOOLTIPTEXT getTooltipText = (PPH_GRAPH_GETTOOLTIPTEXT)Header;
+
+            if (getTooltipText->Index < getTooltipText->TotalCount)
+            {
+                if (Context->FanRpmGraphState.TooltipIndex != getTooltipText->Index)
+                {
+                    ULONG rpm;
+                    PH_FORMAT format[3];
+
+                    rpm = PhGetItemCircularBuffer_ULONG(&Context->DeviceEntry->FanHistory, getTooltipText->Index);
+
+                    PhInitFormatU(&format[0], rpm);
+                    PhInitFormatS(&format[1], L" RPM\n");
+                    PhInitFormatSR(&format[2], PH_AUTO_T(PH_STRING, PhGetStatisticsTimeString(NULL, getTooltipText->Index))->sr);
+
+                    PhMoveReference(&Context->FanRpmGraphState.TooltipText, PhFormat(format, RTL_NUMBER_OF(format), 0));
+                }
+
+                getTooltipText->Text = PhGetStringRef(Context->FanRpmGraphState.TooltipText);
+            }
+        }
+        break;
+    }
+}
+
+VOID GraphicsDeviceUpdateGraphs(
+    _In_ PDV_GPU_SYSINFO_CONTEXT Context
+    )
+{
+    Context->GpuGraphState.Valid = FALSE;
+    Context->GpuGraphState.TooltipIndex = ULONG_MAX;
+    Graph_Update(Context->GpuGraphHandle);
+
+    Context->DedicatedGraphState.Valid = FALSE;
+    Context->DedicatedGraphState.TooltipIndex = ULONG_MAX;
+    Graph_Update(Context->DedicatedGraphHandle);
+
+    Context->SharedGraphState.Valid = FALSE;
+    Context->SharedGraphState.TooltipIndex = ULONG_MAX;
+    Graph_Update(Context->SharedGraphHandle);
+
+    //if (EtGpuSupported)
+    {
+        Context->PowerUsageGraphState.Valid = FALSE;
+        Context->PowerUsageGraphState.TooltipIndex = ULONG_MAX;
+        Graph_Update(Context->PowerUsageGraphHandle);
+
+        Context->TemperatureGraphState.Valid = FALSE;
+        Context->TemperatureGraphState.TooltipIndex = ULONG_MAX;
+        Graph_Update(Context->TemperatureGraphHandle);
+
+        Context->FanRpmGraphState.Valid = FALSE;
+        Context->FanRpmGraphState.TooltipIndex = ULONG_MAX;
+        Graph_Update(Context->FanRpmGraphHandle);
+    }
+}
+
+VOID GraphicsDeviceUpdatePanel(
+    _In_ PDV_GPU_SYSINFO_CONTEXT Context
+    )
+{
+    PH_FORMAT format[1];
+    WCHAR formatBuffer[512];
+
+    PhInitFormatSize(&format[0], Context->DeviceEntry->CurrentDedicatedUsage);
+
+    if (PhFormatToBuffer(format, RTL_NUMBER_OF(format), formatBuffer, sizeof(formatBuffer), NULL))
+        PhSetWindowText(Context->GpuPanelDedicatedUsageLabel, formatBuffer);
+    else
+        PhSetWindowText(Context->GpuPanelDedicatedUsageLabel, PhaFormatSize(Context->DeviceEntry->CurrentDedicatedUsage, ULONG_MAX)->Buffer);
+
+    PhInitFormatSize(&format[0], Context->DeviceEntry->DedicatedLimit);
+
+    if (PhFormatToBuffer(format, RTL_NUMBER_OF(format), formatBuffer, sizeof(formatBuffer), NULL))
+        PhSetWindowText(Context->GpuPanelDedicatedLimitLabel, formatBuffer);
+    else
+        PhSetWindowText(Context->GpuPanelDedicatedLimitLabel, PhaFormatSize(Context->DeviceEntry->DedicatedLimit, ULONG_MAX)->Buffer);
+
+    PhInitFormatSize(&format[0], Context->DeviceEntry->CurrentSharedUsage);
+
+    if (PhFormatToBuffer(format, RTL_NUMBER_OF(format), formatBuffer, sizeof(formatBuffer), NULL))
+        PhSetWindowText(Context->GpuPanelSharedUsageLabel, formatBuffer);
+    else
+        PhSetWindowText(Context->GpuPanelSharedUsageLabel, PhaFormatSize(Context->DeviceEntry->CurrentSharedUsage, ULONG_MAX)->Buffer);
+
+    PhInitFormatSize(&format[0], Context->DeviceEntry->SharedLimit);
+
+    if (PhFormatToBuffer(format, RTL_NUMBER_OF(format), formatBuffer, sizeof(formatBuffer), NULL))
+        PhSetWindowText(Context->GpuPanelSharedLimitLabel, formatBuffer);
+    else
+        PhSetWindowText(Context->GpuPanelSharedLimitLabel, PhaFormatSize(Context->DeviceEntry->SharedLimit, ULONG_MAX)->Buffer);
+}
+
+BOOLEAN GraphicsDeviceSectionCallback(
+    _In_ PPH_SYSINFO_SECTION Section,
+    _In_ PH_SYSINFO_SECTION_MESSAGE Message,
+    _In_ PVOID Parameter1,
+    _In_ PVOID Parameter2
+    )
+{
+    PDV_GPU_SYSINFO_CONTEXT context = (PDV_GPU_SYSINFO_CONTEXT)Section->Context;
+
+    switch (Message)
+    {
+    case SysInfoDestroy:
+        {
+            if (context->Description)
+            {
+                PhDereferenceObject(context->Description);
+                context->Description = NULL;
+            }
+
+            if (context->GpuDialog)
+            {
+                GraphicsDeviceUninitializeDialog(context);
+                context->GpuDialog = NULL;
+            }
+
+            if (context->DeviceEntry)
+            {
+                PhDereferenceObject(context->DeviceEntry);
+                context->DeviceEntry = NULL;
+            }
+
+            PhDereferenceObject(context);
+        }
+        return TRUE;
+    case SysInfoTick:
+        {
+            if (context->GpuDialog)
+            {
+                GraphicsDeviceTickDialog(context);
+            }
+        }
+        return TRUE;
+    case SysInfoViewChanging:
+        {
+            PH_SYSINFO_VIEW_TYPE view = (PH_SYSINFO_VIEW_TYPE)PtrToUlong(Parameter1);
+            PPH_SYSINFO_SECTION section = (PPH_SYSINFO_SECTION)Parameter2;
+
+            if (view == SysInfoSummaryView || section != Section)
+                return TRUE;
+
+            if (context->GpuGraphHandle)
+            {
+                context->GpuGraphState.Valid = FALSE;
+                context->GpuGraphState.TooltipIndex = ULONG_MAX;
+                Graph_Draw(context->GpuGraphHandle);
+            }
+
+            if (context->DedicatedGraphHandle)
+            {
+                context->DedicatedGraphState.Valid = FALSE;
+                context->DedicatedGraphState.TooltipIndex = ULONG_MAX;
+                Graph_Draw(context->DedicatedGraphHandle);
+            }
+
+            if (context->SharedGraphHandle)
+            {
+                context->SharedGraphState.Valid = FALSE;
+                context->SharedGraphState.TooltipIndex = ULONG_MAX;
+                Graph_Draw(context->SharedGraphHandle);
+            }
+
+            //if (EtGpuSupported)
+            {
+                if (context->PowerUsageGraphHandle)
+                {
+                    context->PowerUsageGraphState.Valid = FALSE;
+                    context->PowerUsageGraphState.TooltipIndex = ULONG_MAX;
+                    Graph_Draw(context->PowerUsageGraphHandle);
+                }
+
+                if (context->TemperatureGraphHandle)
+                {
+                    context->TemperatureGraphState.Valid = FALSE;
+                    context->TemperatureGraphState.TooltipIndex = ULONG_MAX;
+                    Graph_Draw(context->TemperatureGraphHandle);
+                }
+
+                if (context->FanRpmGraphHandle)
+                {
+                    context->FanRpmGraphState.Valid = FALSE;
+                    context->FanRpmGraphState.TooltipIndex = ULONG_MAX;
+                    Graph_Draw(context->FanRpmGraphHandle);
+                }
+            }
+        }
+        return TRUE;
+    case SysInfoCreateDialog:
+        {
+            PPH_SYSINFO_CREATE_DIALOG createDialog = Parameter1;
+
+            createDialog->Instance = PluginInstance->DllBase;
+            createDialog->Template = MAKEINTRESOURCE(IDD_GPUDEVICE_DIALOG);
+            createDialog->DialogProc = GraphicsDeviceDialogProc;
+            createDialog->Parameter = context;
+        }
+        return TRUE;
+    case SysInfoGraphGetDrawInfo:
+        {
+            PPH_GRAPH_DRAW_INFO drawInfo = Parameter1;
+
+            drawInfo->Flags = PH_GRAPH_USE_GRID_X | PH_GRAPH_USE_GRID_Y | (GraphicsEnableScaleText ? PH_GRAPH_LABEL_MAX_Y : 0);
+            Section->Parameters->ColorSetupFunction(drawInfo, PhGetIntegerSetting(SETTING_COLOR_CPU_KERNEL), 0, Section->Parameters->WindowDpi);
+            PhGetDrawInfoGraphBuffers(&Section->GraphState.Buffers, drawInfo, context->DeviceEntry->GpuUsageHistory.Count);
+
+            if (!Section->GraphState.Valid)
+            {
+                PhCopyCircularBuffer_FLOAT(&context->DeviceEntry->GpuUsageHistory, Section->GraphState.Data1, drawInfo->LineDataCount);
+
+                if (GraphicsEnableScaleGraph)
+                {
+                    FLOAT max = 0;
+
+                    for (ULONG i = 0; i < drawInfo->LineDataCount; i++)
+                    {
+                        FLOAT data = Section->GraphState.Data1[i];
+
+                        if (max < data)
+                            max = data;
+                    }
+
+                    if (max != 0)
+                    {
+                        PhDivideSinglesBySingle(Section->GraphState.Data1, max, drawInfo->LineDataCount);
+                    }
+
+                    if (GraphicsEnableScaleText)
+                    {
+                        drawInfo->LabelYFunction = PhSiDoubleLabelYFunction;
+                        drawInfo->LabelYFunctionParameter = max;
+                    }
+                }
+                else
+                {
+                    if (GraphicsEnableScaleText)
+                    {
+                        drawInfo->LabelYFunction = PhSiDoubleLabelYFunction;
+                        drawInfo->LabelYFunctionParameter = 1.0f;
+                    }
+                }
+
+                Section->GraphState.Valid = TRUE;
+            }
+        }
+        return TRUE;
+    case SysInfoGraphGetTooltipText:
+        {
+            PPH_SYSINFO_GRAPH_GET_TOOLTIP_TEXT getTooltipText = Parameter1;
+            FLOAT gpu;
+            PH_FORMAT format[3];
+
+            gpu = PhGetItemCircularBuffer_FLOAT(&context->DeviceEntry->GpuUsageHistory, getTooltipText->Index);
+
+            // %.2f%%%s\n%s
+            PhInitFormatF(&format[0], gpu * 100, 2);
+            PhInitFormatS(&format[1], L"%\n");
+            PhInitFormatSR(&format[2], PH_AUTO_T(PH_STRING, PhGetStatisticsTimeString(NULL, getTooltipText->Index))->sr);
+
+            PhMoveReference(&Section->GraphState.TooltipText, PhFormat(format, RTL_NUMBER_OF(format), 0));
+
+            getTooltipText->Text = PhGetStringRef(Section->GraphState.TooltipText);
+        }
+        return TRUE;
+    case SysInfoGraphDrawPanel:
+        {
+            PPH_SYSINFO_DRAW_PANEL drawPanel = Parameter1;
+
+            if (PhIsNullOrEmptyString(context->Description))
+            {
+                PhMoveReference(&context->Description, GraphicsDeviceGetAdapterDescription(context->DeviceEntry->Id.DevicePath));
+            }
+
+            if (!PhIsNullOrEmptyString(context->Description))
+            {
+                drawPanel->Title = PhReferenceObject(context->Description);
+            }
+
+            // Note: Intel IGP devices don't have dedicated usage/limit values. (dmex)
+            if (context->DeviceEntry->CurrentDedicatedUsage && context->DeviceEntry->DedicatedLimit)
+            {
+                PH_FORMAT format[5];
+
+                // %.2f%%\n%s / %s
+                PhInitFormatF(&format[0], context->DeviceEntry->CurrentGpuUsage * 100, 2);
+                PhInitFormatS(&format[1], L"%\n");
+                PhInitFormatSize(&format[2], context->DeviceEntry->CurrentDedicatedUsage);
+                PhInitFormatS(&format[3], L" / ");
+                PhInitFormatSize(&format[4], context->DeviceEntry->DedicatedLimit);
+
+                drawPanel->SubTitle = PhFormat(format, 5, 64);
+
+                // %.2f%%\n%s
+                PhInitFormatF(&format[0], context->DeviceEntry->CurrentGpuUsage * 100, 2);
+                PhInitFormatS(&format[1], L"%\n");
+                PhInitFormatSize(&format[2], context->DeviceEntry->CurrentDedicatedUsage);
+
+                drawPanel->SubTitleOverflow = PhFormat(format, 3, 64);
+            }
+            else if (context->DeviceEntry->CurrentSharedUsage && context->DeviceEntry->SharedLimit)
+            {
+                PH_FORMAT format[5];
+
+                // %.2f%%\n%s / %s
+                PhInitFormatF(&format[0], context->DeviceEntry->CurrentGpuUsage * 100, 2);
+                PhInitFormatS(&format[1], L"%\n");
+                PhInitFormatSize(&format[2], context->DeviceEntry->CurrentSharedUsage);
+                PhInitFormatS(&format[3], L" / ");
+                PhInitFormatSize(&format[4], context->DeviceEntry->SharedLimit);
+
+                drawPanel->SubTitle = PhFormat(format, 5, 64);
+
+                // %.2f%%\n%s
+                PhInitFormatF(&format[0], context->DeviceEntry->CurrentGpuUsage * 100, 2);
+                PhInitFormatS(&format[1], L"%\n");
+                PhInitFormatSize(&format[2], context->DeviceEntry->CurrentSharedUsage);
+
+                drawPanel->SubTitleOverflow = PhFormat(format, 3, 64);
+            }
+            else
+            {
+                PH_FORMAT format[2];
+
+                // %.2f%%\n
+                PhInitFormatF(&format[0], context->DeviceEntry->CurrentGpuUsage * 100, 2);
+                PhInitFormatS(&format[1], L"%\n");
+
+                drawPanel->SubTitle = PhFormat(format, RTL_NUMBER_OF(format), 0);
+            }
+        }
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
+_Function_class_(PH_GRAPH_MESSAGE_CALLBACK)
+BOOLEAN GraphicsDeviceGraphMessageCallback(
+    _In_ HWND WindowHandle,
+    _In_ ULONG Message,
+    _In_ PVOID Parameter1,
+    _In_ PVOID Parameter2,
+    _In_ PVOID Context
+    )
+{
+    PDV_GPU_SYSINFO_CONTEXT context = (PDV_GPU_SYSINFO_CONTEXT)Context;
+    NMHDR *header = (NMHDR *)Parameter1;
+
+    if (WindowHandle == context->GpuGraphHandle)
+    {
+        GraphicsDeviceNotifyGpuGraph(context, header);
+    }
+    else if (WindowHandle == context->DedicatedGraphHandle)
+    {
+        GraphicsDeviceNotifyDedicatedGraph(context, header);
+    }
+    else if (WindowHandle == context->SharedGraphHandle)
+    {
+        GraphicsDeviceNotifySharedGraph(context, header);
+    }
+    else if (WindowHandle == context->PowerUsageGraphHandle)
+    {
+        GraphicsDeviceNotifyPowerUsageGraph(context, header);
+    }
+    else if (WindowHandle == context->TemperatureGraphHandle)
+    {
+        GraphicsDeviceNotifyTemperatureGraph(context, header);
+    }
+    else if (WindowHandle == context->FanRpmGraphHandle)
+    {
+        GraphicsDeviceNotifyFanRpmGraph(context, header);
+    }
+
+    return TRUE;
+}
+
+INT_PTR CALLBACK GraphicsDeviceDialogProc(
+    _In_ HWND WindowHandle,
+    _In_ UINT WindowMessage,
+    _In_ WPARAM wParam,
+    _In_ LPARAM lParam
+    )
+{
+    PDV_GPU_SYSINFO_CONTEXT context = NULL;
+
+    if (WindowMessage == WM_INITDIALOG)
+    {
+        context = (PDV_GPU_SYSINFO_CONTEXT)lParam;
+
+        PhSetWindowContext(WindowHandle, PH_WINDOW_CONTEXT_DEFAULT, context);
+    }
+    else
+    {
+        context = PhGetWindowContext(WindowHandle, PH_WINDOW_CONTEXT_DEFAULT);
+    }
+
+    if (context == NULL)
+        return FALSE;
+
+    switch (WindowMessage)
+    {
+    case WM_INITDIALOG:
+        {
+            PPH_LAYOUT_ITEM graphItem;
+            PPH_LAYOUT_ITEM panelItem;
+            PPH_STRING adapterDescription;
+            PPH_STRING description;
+
+            context->GpuDialog = WindowHandle;
+
+            PhInitializeLayoutManager(&context->GpuLayoutManager, WindowHandle);
+            PhAddLayoutItem(&context->GpuLayoutManager, GetDlgItem(WindowHandle, IDC_GPUNAME), NULL, PH_ANCHOR_LEFT | PH_ANCHOR_TOP | PH_ANCHOR_RIGHT | PH_LAYOUT_FORCE_INVALIDATE);
+            graphItem = PhAddLayoutItem(&context->GpuLayoutManager, GetDlgItem(WindowHandle, IDC_GRAPH_LAYOUT), NULL, PH_ANCHOR_ALL);
+            panelItem = PhAddLayoutItem(&context->GpuLayoutManager, GetDlgItem(WindowHandle, IDC_PANEL_LAYOUT), NULL, PH_ANCHOR_LEFT | PH_ANCHOR_RIGHT | PH_ANCHOR_BOTTOM);
+            context->GpuGraphMargin = graphItem->Margin;
+            context->GpuGraphMarginScaled = context->GpuGraphMargin;
+            PhGetMarginDpiValue(&context->GpuGraphMarginScaled, context->SysinfoSection->Parameters->WindowDpi, TRUE);
+
+            GraphicsDeviceInitializeDialog(context);
+            GraphicsDeviceInitializeDialogDpi(context);
+
+            SetWindowFont(GetDlgItem(WindowHandle, IDC_TITLE), context->SysinfoSection->Parameters->LargeFont, FALSE);
+            SetWindowFont(GetDlgItem(WindowHandle, IDC_GPUNAME), context->SysinfoSection->Parameters->MediumFont, FALSE);
+
+            adapterDescription = PH_AUTO_T(PH_STRING, GraphicsDeviceGetAdapterDescription(context->DeviceEntry->Id.DevicePath));
+
+            PhSetDialogItemText(WindowHandle, IDC_TITLE, PhGetString(adapterDescription));
+
+            if (GraphicsQueryDeviceProperties(PhGetString(context->DeviceEntry->Id.DevicePath), &description, NULL, NULL, NULL, NULL, NULL))
+                PhSetDialogItemText(WindowHandle, IDC_GPUNAME, PhGetString(PH_AUTO_T(PH_STRING, description)));
+            else
+                PhSetDialogItemText(WindowHandle, IDC_GPUNAME, PhGetString(adapterDescription));
+
+            context->GpuPanel = PhCreateDialog(PluginInstance->DllBase, MAKEINTRESOURCE(IDD_GPUDEVICE_PANEL), WindowHandle, GraphicsDevicePanelDialogProc, context);
+            ShowWindow(context->GpuPanel, SW_SHOW);
+            PhAddLayoutItemEx(&context->GpuLayoutManager, context->GpuPanel, NULL, PH_ANCHOR_LEFT | PH_ANCHOR_RIGHT | PH_ANCHOR_BOTTOM, &panelItem->Margin);
+
+            GraphicsDeviceCreateGraphs(context);
+            GraphicsDeviceUpdateGraphs(context);
+            GraphicsDeviceUpdatePanel(context);
+        }
+        break;
+    case WM_DESTROY:
+        {
+            PhDeleteLayoutManager(&context->GpuLayoutManager);
+        }
+        break;
+    case WM_NCDESTROY:
+        {
+            PhRemoveWindowContext(WindowHandle, PH_WINDOW_CONTEXT_DEFAULT);
+        }
+        break;
+    case WM_DPICHANGED_AFTERPARENT:
+        {
+            GraphicsDeviceInitializeDialogDpi(context);
+
+            context->GpuGraphMarginScaled = context->GpuGraphMargin;
+            PhGetMarginDpiValue(&context->GpuGraphMarginScaled, context->SysinfoSection->Parameters->WindowDpi, TRUE);
+
+            if (context->SysinfoSection->Parameters->LargeFont)
+            {
+                SetWindowFont(GetDlgItem(WindowHandle, IDC_TITLE), context->SysinfoSection->Parameters->LargeFont, FALSE);
+            }
+
+            if (context->SysinfoSection->Parameters->MediumFont)
+            {
+                SetWindowFont(GetDlgItem(WindowHandle, IDC_GPUNAME), context->SysinfoSection->Parameters->MediumFont, FALSE);
+            }
+
+            PhLayoutManagerUpdate(&context->GpuLayoutManager, context->SysinfoSection->Parameters->WindowDpi);
+            PhLayoutManagerLayout(&context->GpuLayoutManager);
+            GraphicsDeviceLayoutGraphs(context);
+        }
+        break;
+    case WM_SIZE:
+        {
+            PhLayoutManagerLayout(&context->GpuLayoutManager);
+
+            GraphicsDeviceLayoutGraphs(context);
+        }
+        break;
+    case WM_CTLCOLORBTN:
+        return HANDLE_WM_CTLCOLORBTN(WindowHandle, wParam, lParam, PhWindowThemeControlColor);
+    case WM_CTLCOLORDLG:
+        return HANDLE_WM_CTLCOLORDLG(WindowHandle, wParam, lParam, PhWindowThemeControlColor);
+    case WM_CTLCOLORSTATIC:
+        return HANDLE_WM_CTLCOLORSTATIC(WindowHandle, wParam, lParam, PhWindowThemeControlColor);
+    }
+
+    return FALSE;
+}
+
+INT_PTR CALLBACK GraphicsDevicePanelDialogProc(
+    _In_ HWND WindowHandle,
+    _In_ UINT WindowMessage,
+    _In_ WPARAM wParam,
+    _In_ LPARAM lParam
+    )
+{
+    PDV_GPU_SYSINFO_CONTEXT context = NULL;
+
+    if (WindowMessage == WM_INITDIALOG)
+    {
+        context = (PDV_GPU_SYSINFO_CONTEXT)lParam;
+
+        PhSetWindowContext(WindowHandle, PH_WINDOW_CONTEXT_DEFAULT, context);
+    }
+    else
+    {
+        context = PhGetWindowContext(WindowHandle, PH_WINDOW_CONTEXT_DEFAULT);
+    }
+
+    if (context == NULL)
+        return FALSE;
+
+    switch (WindowMessage)
+    {
+    case WM_INITDIALOG:
+        {
+            context->GpuPanelDedicatedUsageLabel = GetDlgItem(WindowHandle, IDC_ZDEDICATEDCURRENT_V);
+            context->GpuPanelDedicatedLimitLabel = GetDlgItem(WindowHandle, IDC_ZDEDICATEDLIMIT_V);
+            context->GpuPanelSharedUsageLabel = GetDlgItem(WindowHandle, IDC_ZSHAREDCURRENT_V);
+            context->GpuPanelSharedLimitLabel = GetDlgItem(WindowHandle, IDC_ZSHAREDLIMIT_V);
+        }
+        break;
+    case WM_NCDESTROY:
+        {
+            PhRemoveWindowContext(WindowHandle, PH_WINDOW_CONTEXT_DEFAULT);
+        }
+        break;
+    case WM_COMMAND:
+        {
+            switch (GET_WM_COMMAND_ID(wParam, lParam))
+            {
+            case IDC_NODES:
+                GraphicsDeviceShowNodesDialog(context, context->GpuDialog);
+                break;
+            case IDC_DETAILS:
+                GraphicsDeviceShowDetailsDialog(context, context->GpuDialog);
+                break;
+            }
+        }
+        break;
+    case WM_CTLCOLORBTN:
+        return HANDLE_WM_CTLCOLORBTN(WindowHandle, wParam, lParam, PhWindowThemeControlColor);
+    case WM_CTLCOLORDLG:
+        return HANDLE_WM_CTLCOLORDLG(WindowHandle, wParam, lParam, PhWindowThemeControlColor);
+    case WM_CTLCOLORSTATIC:
+        return HANDLE_WM_CTLCOLORSTATIC(WindowHandle, wParam, lParam, PhWindowThemeControlColor);
+    }
+
+    return FALSE;
+}

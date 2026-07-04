@@ -1,0 +1,2133 @@
+/*
+ * Copyright (c) 2022 Winsider Seminars & Solutions, Inc.  All rights reserved.
+ *
+ * This file is part of System Informer.
+ *
+ * Authors:
+ *
+ *     wj32    2010-2016
+ *     dmex    2011-2026
+ *
+ */
+
+#include "toolstatus.h"
+#include <trace.h>
+
+TOOLSTATUS_CONFIG ToolStatusConfig = { 0 };
+HWND ProcessTreeNewHandle = NULL;
+HWND ServiceTreeNewHandle = NULL;
+HWND NetworkTreeNewHandle = NULL;
+LONG SelectedTabIndex = 0;
+ULONG MaxInitializationDelay = 3;
+BOOLEAN UpdateAutomatically = TRUE;
+BOOLEAN UpdateGraphs = TRUE;
+BOOLEAN EnableThemeSupport = FALSE;
+BOOLEAN IsWindowSizeMove = FALSE;
+BOOLEAN IsWindowMinimized = FALSE;
+BOOLEAN IsWindowMaximized = FALSE;
+BOOLEAN IconSingleClick = FALSE;
+BOOLEAN EnableAvxSupport = FALSE;
+BOOLEAN EnableGraphMaxScale = FALSE;
+BOOLEAN RestoreRowAfterSearch = FALSE;
+TOOLBAR_DISPLAY_STYLE DisplayStyle = TOOLBAR_DISPLAY_STYLE_SELECTIVETEXT;
+SEARCHBOX_DISPLAY_MODE SearchBoxDisplayMode = SEARCHBOX_DISPLAY_MODE_ALWAYSSHOW;
+REBAR_DISPLAY_LOCATION RebarDisplayLocation = REBAR_DISPLAY_LOCATION_TOP;
+HWND RebarHandle = NULL;
+#if TOOLSTATUS_ENABLE_MENUBAR
+HWND MenuBarHandle = NULL;
+#endif
+HWND ToolBarHandle = NULL;
+HWND SearchboxHandle = NULL;
+WNDPROC MainWindowHookProc = NULL;
+HWND MainWindowHandle = NULL;
+HMENU MainMenu = NULL;
+HACCEL AcceleratorTable = NULL;
+ULONG_PTR SearchMatchHandle = 0;
+ULONG RestoreSearchSelectedProcessId = ULONG_MAX;
+PPH_TREENEW_NODE RestoreSearchSelectedNode = NULL;
+HWND RestoreSearchTreeHandle = NULL;
+PH_PLUGIN_SYSTEM_STATISTICS SystemStatistics = { 0 };
+PPH_TN_FILTER_ENTRY ProcessTreeFilterEntry = NULL;
+PPH_TN_FILTER_ENTRY ServiceTreeFilterEntry = NULL;
+PPH_TN_FILTER_ENTRY NetworkTreeFilterEntry = NULL;
+PPH_PLUGIN PluginInstance = NULL;
+
+static ULONG TargetingMode = 0;
+static PPH_WINDOW_TARGETING_CONTEXT TargetingContext = NULL;
+static PH_CALLBACK_REGISTRATION PluginLoadCallbackRegistration;
+static PH_CALLBACK_REGISTRATION PluginMenuItemCallbackRegistration;
+static PH_CALLBACK_REGISTRATION MainMenuInitializingCallbackRegistration;
+static PH_CALLBACK_REGISTRATION PluginShowOptionsCallbackRegistration;
+static PH_CALLBACK_REGISTRATION MainWindowShowingCallbackRegistration;
+static PH_CALLBACK_REGISTRATION ProcessesUpdatedCallbackRegistration;
+static PH_CALLBACK_REGISTRATION SettingsUpdatedCallbackRegistration;
+static PH_CALLBACK_REGISTRATION LayoutPaddingCallbackRegistration;
+static PH_CALLBACK_REGISTRATION TabPageCallbackRegistration;
+static PH_CALLBACK_REGISTRATION ProcessTreeNewInitializingCallbackRegistration;
+static PH_CALLBACK_REGISTRATION ServiceTreeNewInitializingCallbackRegistration;
+static PH_CALLBACK_REGISTRATION NetworkTreeNewInitializingCallbackRegistration;
+
+static BOOLEAN ToolStatusIsValidTargetWindow(
+    _In_opt_ HWND WindowHandle,
+    _Out_opt_ PCLIENT_ID ClientId
+    )
+{
+    CLIENT_ID clientId;
+
+    if (!WindowHandle || !IsWindow(WindowHandle))
+        return FALSE;
+
+    if (!NT_SUCCESS(PhGetWindowClientId(WindowHandle, &clientId)))
+        return FALSE;
+
+    if (clientId.UniqueProcess == NtCurrentProcessId())
+        return FALSE;
+
+    if (ClientId)
+        *ClientId = clientId;
+
+    return TRUE;
+}
+
+_Function_class_(PH_CALLBACK_FUNCTION)
+VOID NTAPI ProcessesUpdatedCallback(
+    _In_opt_ PVOID Parameter,
+    _In_opt_ PVOID Context
+    )
+{
+    if (PtrToUlong(Parameter) < MaxInitializationDelay)
+        return;
+    if (TaskbarMainWndExiting)
+        return;
+
+    PhPluginGetSystemStatistics(&SystemStatistics);
+
+    if (ToolStatusConfig.ToolBarEnabled && ToolBarHandle && UpdateGraphs)
+        ToolbarUpdateGraphs();
+
+    if (ToolStatusConfig.StatusBarEnabled && StatusBarHandle && UpdateGraphs)
+        StatusBarUpdate(FALSE);
+
+    TaskbarUpdateEvents();
+}
+
+_Function_class_(PH_CALLBACK_FUNCTION)
+VOID NTAPI TreeNewInitializingCallback(
+    _In_opt_ PVOID Parameter,
+    _In_opt_ PVOID Context
+    )
+{
+    if (Context && Parameter)
+    {
+        *(HWND*)Context = ((PPH_PLUGIN_TREENEW_INFORMATION)Parameter)->TreeNewHandle;
+    }
+}
+
+HWND GetCurrentTreeNewHandle(
+    VOID
+    )
+{
+    switch (SelectedTabIndex)
+    {
+    case 0:
+        return ProcessTreeNewHandle;
+    case 1:
+        return ServiceTreeNewHandle;
+    case 2:
+        return NetworkTreeNewHandle;
+    }
+
+    return GetTabIndexTreeNewHandle(SelectedTabIndex);
+}
+
+VOID ToolStatusApplyMainMenuVisibility(
+    _In_ HWND WindowHandle
+    )
+{
+    if (!WindowHandle || !MainMenu)
+        return;
+
+    if (
+#if TOOLSTATUS_ENABLE_MENUBAR
+        (ToolStatusConfig.EnableMenuBar && MenuBarHandle) ||
+#endif
+        ToolStatusConfig.AutoHideMenu
+        )
+    {
+        if (GetMenu(WindowHandle))
+        {
+            SetMenu(WindowHandle, NULL);
+            DrawMenuBar(WindowHandle);
+        }
+    }
+    else if (!GetMenu(WindowHandle))
+    {
+        SetMenu(WindowHandle, MainMenu);
+        DrawMenuBar(WindowHandle);
+    }
+}
+
+#if TOOLSTATUS_ENABLE_MENUBAR
+static VOID ToggleMenuBar(
+    _In_ HWND WindowHandle
+    )
+{
+    ULONG toolbarIndex;
+
+    ReBarSaveLayoutSettings();
+
+    ToolStatusConfig.EnableMenuBar = !ToolStatusConfig.EnableMenuBar;
+
+    PhSetIntegerSetting(SETTING_NAME_TOOLSTATUS_CONFIG, ToolStatusConfig.Flags);
+
+    if (ToolStatusConfig.EnableMenuBar)
+    {
+        if (ToolStatusConfig.ToolBarEnabled && MainMenu && !MenuBarHandle)
+        {
+            if (!RebarHandle)
+                RebarCreate();
+
+            MenuBarCreate();
+        }
+
+        MenuBarApplySettings();
+    }
+    else
+    {
+        ULONG bandStyle;
+
+        RebarBandRemove(REBAR_BAND_ID_MENUBAR);
+        MenuBarDestroy();
+
+        toolbarIndex = RebarBandToIndex(REBAR_BAND_ID_TOOLBAR);
+
+        if (toolbarIndex != ULONG_MAX && RebarGetBandIndexStyle(toolbarIndex, &bandStyle))
+        {
+            ClearFlag(bandStyle, RBBS_BREAK);
+            RebarSetBandIndexStyle(toolbarIndex, bandStyle);
+        }
+    }
+
+    ReBarLoadLayoutSettings();
+
+    if (ToolStatusConfig.EnableMenuBar)
+        MenuBarApplySettings();
+
+    ToolStatusApplyMainMenuVisibility(WindowHandle);
+    ReBarSaveLayoutSettings();
+    InvalidateMainWindowLayout();
+}
+#endif
+
+VOID ShowCustomizeMenu(
+    _In_ HWND WindowHandle
+    )
+{
+    POINT cursorPos;
+    PPH_EMENU menu;
+    PPH_EMENU_ITEM mainMenuItem;
+    PPH_EMENU_ITEM searchMenuItem;
+#if TOOLSTATUS_ENABLE_MENUBAR
+    //PPH_EMENU_ITEM menuBarMenuItem;
+#endif
+    PPH_EMENU_ITEM lockMenuItem;
+    PPH_EMENU_ITEM selectedItem;
+
+    if (!PhGetMessagePos(&cursorPos))
+        return;
+
+    menu = PhCreateEMenu();
+    PhInsertEMenuItem(menu, mainMenuItem = PhCreateEMenuItem(0, COMMAND_ID_ENABLE_MENU, L"Main menu (auto-hide)", NULL, NULL), ULONG_MAX);
+    PhInsertEMenuItem(menu, searchMenuItem = PhCreateEMenuItem(0, COMMAND_ID_ENABLE_SEARCHBOX, L"Search box", NULL, NULL), ULONG_MAX);
+#if TOOLSTATUS_ENABLE_MENUBAR
+    //PhInsertEMenuItem(menu, menuBarMenuItem = PhCreateEMenuItem(0, COMMAND_ID_ENABLE_MENUBAR, L"Menu bar", NULL, NULL), ULONG_MAX);
+#endif
+    PhInsertEMenuItem(menu, PhCreateEMenuSeparator(), ULONG_MAX);
+    ToolbarGraphCreateMenu(menu, COMMAND_ID_GRAPHS_CUSTOMIZE);
+    PhInsertEMenuItem(menu, PhCreateEMenuSeparator(), ULONG_MAX);
+    PhInsertEMenuItem(menu, lockMenuItem = PhCreateEMenuItem(0, COMMAND_ID_TOOLBAR_LOCKUNLOCK, L"Lock the toolbar", NULL, NULL), ULONG_MAX);
+    PhInsertEMenuItem(menu, PhCreateEMenuItem(0, COMMAND_ID_TOOLBAR_CUSTOMIZE, L"Customize...", NULL, NULL), ULONG_MAX);
+
+    if (ToolStatusConfig.AutoHideMenu)
+        mainMenuItem->Flags |= PH_EMENU_CHECKED;
+    if (ToolStatusConfig.SearchBoxEnabled)
+        searchMenuItem->Flags |= PH_EMENU_CHECKED;
+#if TOOLSTATUS_ENABLE_MENUBAR
+    //if (ToolStatusConfig.EnableMenuBar)
+    //    menuBarMenuItem->Flags |= PH_EMENU_CHECKED;
+#endif
+    if (ToolStatusConfig.ToolBarLocked)
+        lockMenuItem->Flags |= PH_EMENU_CHECKED;
+
+    selectedItem = PhShowEMenu(
+        menu,
+        WindowHandle,
+        PH_EMENU_SHOW_LEFTRIGHT,
+        PH_ALIGN_LEFT | PH_ALIGN_TOP,
+        cursorPos.x,
+        cursorPos.y
+        );
+
+    if (selectedItem && selectedItem->Id != ULONG_MAX)
+    {
+        switch (selectedItem->Id)
+        {
+        case COMMAND_ID_ENABLE_MENU:
+            {
+                ToolStatusConfig.AutoHideMenu = !ToolStatusConfig.AutoHideMenu;
+
+                PhSetIntegerSetting(SETTING_NAME_TOOLSTATUS_CONFIG, ToolStatusConfig.Flags);
+
+                ToolStatusApplyMainMenuVisibility(WindowHandle);
+            }
+            break;
+        case COMMAND_ID_ENABLE_SEARCHBOX:
+            {
+                ToolStatusConfig.SearchBoxEnabled = !ToolStatusConfig.SearchBoxEnabled;
+
+                PhSetIntegerSetting(SETTING_NAME_TOOLSTATUS_CONFIG, ToolStatusConfig.Flags);
+
+                ToolbarLoadSettings(FALSE);
+                ReBarSaveLayoutSettings();
+
+                if (ToolStatusConfig.SearchBoxEnabled) // && !ToolStatusConfig.SearchAutoFocus)
+                {
+                    // The window focus was reset by Windows while creating child
+                    // windows in ToolbarLoadSettings, so make sure we reset the focus
+                    // otherwise you can't navigate with the keyboard. (dmex)
+                    SetFocus(WindowHandle);
+                }
+            }
+            break;
+#if TOOLSTATUS_ENABLE_MENUBAR
+        case COMMAND_ID_ENABLE_MENUBAR:
+            ToggleMenuBar(WindowHandle);
+            break;
+#endif
+        case COMMAND_ID_TOOLBAR_LOCKUNLOCK:
+            {
+                ULONG bandCount;
+                ULONG bandIndex;
+
+                if (!RebarGetBandCount(&bandCount))
+                    break;
+
+                for (bandIndex = 0; bandIndex < bandCount; bandIndex++)
+                {
+                    REBARBANDINFO rebarBandInfo =
+                    {
+                        sizeof(REBARBANDINFO),
+                        RBBIM_STYLE
+                    };
+
+                    SendMessage(RebarHandle, RB_GETBANDINFO, bandIndex, (LPARAM)&rebarBandInfo);
+
+                    if (!(rebarBandInfo.fStyle & RBBS_GRIPPERALWAYS))
+                    {
+                        // Removing the RBBS_NOGRIPPER style doesn't remove the gripper padding,
+                        // So we toggle the RBBS_GRIPPERALWAYS style to make the Toolbar remove the padding.
+
+                        SetFlag(rebarBandInfo.fStyle, RBBS_GRIPPERALWAYS);
+
+                        SendMessage(RebarHandle, RB_SETBANDINFO, bandIndex, (LPARAM)&rebarBandInfo);
+
+                        ClearFlag(rebarBandInfo.fStyle, RBBS_GRIPPERALWAYS);
+                    }
+
+                    if (rebarBandInfo.fStyle & RBBS_NOGRIPPER)
+                    {
+                        ClearFlag(rebarBandInfo.fStyle, RBBS_NOGRIPPER);
+                    }
+                    else
+                    {
+                        SetFlag(rebarBandInfo.fStyle, RBBS_NOGRIPPER);
+                    }
+
+                    SendMessage(RebarHandle, RB_SETBANDINFO, bandIndex, (LPARAM)&rebarBandInfo);
+                }
+
+                ToolStatusConfig.ToolBarLocked = !ToolStatusConfig.ToolBarLocked;
+
+                PhSetIntegerSetting(SETTING_NAME_TOOLSTATUS_CONFIG, ToolStatusConfig.Flags);
+
+                ToolbarLoadSettings(FALSE);
+            }
+            break;
+        case COMMAND_ID_TOOLBAR_CUSTOMIZE:
+            {
+                ToolBarShowCustomizeDialog(WindowHandle);
+            }
+            break;
+        case COMMAND_ID_GRAPHS_CUSTOMIZE:
+            {
+                ToolbarUpdateVisibleGraph(selectedItem->Context);
+            }
+            break;
+        }
+    }
+
+    PhDestroyEMenu(menu);
+}
+
+_Function_class_(PH_CALLBACK_FUNCTION)
+VOID NTAPI TabPageUpdatedCallback(
+    _In_opt_ PVOID Parameter,
+    _In_opt_ PVOID Context
+    )
+{
+    LONG tabIndex = PtrToLong(Parameter);
+
+    SelectedTabIndex = tabIndex;
+
+    if (!SearchboxHandle)
+        return;
+
+    switch (tabIndex)
+    {
+    case 0:
+        Edit_SetCueBannerText(SearchboxHandle, L"Search Processes (Ctrl+K)");
+        break;
+    case 1:
+        Edit_SetCueBannerText(SearchboxHandle, L"Search Services (Ctrl+K)");
+        break;
+    case 2:
+        Edit_SetCueBannerText(SearchboxHandle, L"Search Network (Ctrl+K)");
+        break;
+    default:
+        {
+            static CONST PH_STRINGREF string = PH_STRINGREF_INIT(L" (Ctrl+K)");
+            PPH_STRING text;
+
+            text = PH_AUTO_T(PH_STRING, GetTabIndexBannerText(tabIndex, &string));
+            Edit_SetCueBannerText(SearchboxHandle, PhGetStringOrDefault(text, L"Search disabled"));
+        }
+        break;
+    }
+
+    //if (ToolStatusConfig.SearchAutoFocus)
+    //    SetFocus(SearchboxHandle);
+}
+
+_Function_class_(PH_CALLBACK_FUNCTION)
+VOID NTAPI LayoutPaddingCallback(
+    _In_ PVOID Parameter,
+    _In_ PVOID Context
+    )
+{
+    PPH_LAYOUT_PADDING_DATA layoutPadding = Parameter;
+
+    if (RebarHandle && ToolStatusConfig.ToolBarEnabled)
+    {
+        RECT rebarRect;
+        RECT parentRect;
+        LONG desiredHeight;
+
+        // Recalculate rows before querying the height. This is required after changing
+        // RBBS_BREAK or a band's child height on a live rebar control.
+        SendMessage(RebarHandle, WM_SIZE, 0, 0);
+
+        // Ask the rebar for its full computed height. RB_GETBARHEIGHT returns the control's
+        // internal _cy, which the recalc accumulates as the sum of every row's line height
+        // plus the inter-row spacing (cyBottomHeight) and band-border edges. Summing
+        // RB_GETROWHEIGHT per row, or taking the max band bottom, drops that trailing
+        // spacing/edge and under-counts, clipping the last row (the toolbar/searchbox row
+        // once the menu bar pushes them onto a second row). The control's own value is the
+        // authoritative height the parent should size the rebar window to.
+        desiredHeight = (LONG)SendMessage(RebarHandle, RB_GETBARHEIGHT, 0, 0);
+
+        // Explicitly resize the rebar window to the computed height so that all rows
+        // are visible. Sending WM_SIZE directly to the rebar only re-layouts bands
+        // within the existing window bounds and does not grow the window itself.
+        if (desiredHeight > 0 && PhGetClientRect(MainWindowHandle, &parentRect))
+        {
+            SetWindowPos(RebarHandle, NULL, 0, 0,
+                parentRect.right, desiredHeight,
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+        }
+
+        SendMessage(RebarHandle, WM_SIZE, 0, 0);
+
+        if (PhGetClientRect(RebarHandle, &rebarRect))
+        {
+            // Adjust the PH client area and exclude the rebar height.
+            layoutPadding->Padding.top += rebarRect.bottom;
+        }
+
+        // TODO: Replace CCS_TOP with CCS_NOPARENTALIGN and use below code
+        //switch (RebarDisplayLocation)
+        //{
+        //case RebarLocationLeft:
+        //    {
+        //        //x = 0;
+        //        //y = 0;
+        //        //cx = rebarRect.right - rebarRect.left;
+        //        //cy = clientRect.bottom - clientRect.top;
+        //    }
+        //    break;
+        //case RebarLocationTop:
+        //    {
+        //        //x = 0;
+        //        //y = 0;
+        //        //cx = clientRect.right - clientRect.left;
+        //        //cy = clientRect.bottom - clientRect.top;
+        //
+        //        // Adjust the PH client area and exclude the rebar height.
+        //        //layoutPadding->Padding.top += rebarRect.bottom;
+        //    }
+        //    break;
+        //case RebarLocationRight:
+        //    {
+        //        //x = clientRect.right - (rebarRect.right - rebarRect.left);
+        //        //y = 0;
+        //        //cx = rebarRect.right - rebarRect.left;
+        //        //cy = clientRect.bottom - clientRect.top;
+        //    }
+        //    break;
+        //case RebarLocationBottom:
+        //    {
+        //        //x = 0;
+        //        //y = clientRect.bottom - (rebarRect.bottom - rebarRect.top) - (StatusBarEnabled ? rebarRect.bottom + 1 : 0);
+        //        //cx = clientRect.right - clientRect.left;
+        //        //cy = rebarRect.bottom - rebarRect.top;
+        //
+        //        // Adjust the PH client area and exclude the rebar width.
+        //        //layoutPadding->Padding.bottom += rebarRect.bottom;
+        //    }
+        //    break;
+        //}
+        //MoveWindow(RebarHandle, x, y, cx, cy, TRUE);
+
+        //if (SearchBoxDisplayStyle == SearchBoxDisplayAutoHide)
+        //{
+        //    static BOOLEAN isSearchboxVisible = FALSE;
+        //    SIZE idealWidth;
+        //
+        //    // Query the Toolbar ideal width
+        //    SendMessage(ToolBarHandle, TB_GETIDEALSIZE, FALSE, (LPARAM)&idealWidth);
+        //
+        //    // Hide the Searcbox band if the window size is too small...
+        //    if (rebarRect.right > idealWidth.cx)
+        //    {
+        //        if (isSearchboxVisible)
+        //        {
+        //            if (!RebarBandExists(REBAR_BAND_ID_SEARCHBOX))
+        //                RebarBandInsert(REBAR_BAND_ID_SEARCHBOX, SearchboxHandle, 180, 20);
+        //
+        //            isSearchboxVisible = FALSE;
+        //        }
+        //    }
+        //    else
+        //    {
+        //        if (!isSearchboxVisible)
+        //        {
+        //            if (RebarBandExists(REBAR_BAND_ID_SEARCHBOX))
+        //                RebarBandRemove(REBAR_BAND_ID_SEARCHBOX);
+        //
+        //            isSearchboxVisible = TRUE;
+        //        }
+        //    }
+        //}
+    }
+
+    if (StatusBarHandle && ToolStatusConfig.StatusBarEnabled)
+    {
+        RECT statusBarRect;
+
+        SendMessage(StatusBarHandle, WM_SIZE, 0, 0);
+
+        if (PhGetClientRect(StatusBarHandle, &statusBarRect))
+        {
+            // Adjust the PH client area and exclude the StatusBar width.
+            layoutPadding->Padding.bottom += statusBarRect.bottom;
+        }
+
+        //InvalidateRect(StatusBarHandle, NULL, TRUE);
+    }
+}
+
+BOOLEAN CheckRebarLastRedrawMessage(
+    VOID
+    )
+{
+    static LARGE_INTEGER lastUpdateTimeTicks = { 0 };
+    LARGE_INTEGER currentUpdateTimeTicks;
+    LARGE_INTEGER currentUpdateTimeFrequency;
+
+    PhQueryPerformanceCounter(&currentUpdateTimeTicks);
+    PhQueryPerformanceFrequency(&currentUpdateTimeFrequency);
+
+    if (lastUpdateTimeTicks.QuadPart == 0)
+        lastUpdateTimeTicks.QuadPart = currentUpdateTimeTicks.QuadPart;
+
+    if (((currentUpdateTimeTicks.QuadPart - lastUpdateTimeTicks.QuadPart) / currentUpdateTimeFrequency.QuadPart) > 1)
+    {
+        lastUpdateTimeTicks.QuadPart = currentUpdateTimeTicks.QuadPart;
+        return TRUE;
+    }
+
+    lastUpdateTimeTicks.QuadPart = currentUpdateTimeTicks.QuadPart;
+    return FALSE;
+}
+
+VOID InvalidateMainWindowLayout(
+    VOID
+    )
+{
+    // Invalidate plugin window layout.
+    SystemInformer_InvalidateLayoutPadding();
+
+    // Invalidate the main window layout.
+    MainWindowHookProc(MainWindowHandle, WM_SIZE, 0, 0);
+}
+
+VOID UpdateDpiMetrics(
+    _In_ PVOID InvokeContext
+    )
+{
+    // Update fonts/sizes for new DPI.
+    ToolbarWindowFont = SystemInformer_GetFont();
+
+    //if (RebarHandle)
+    //{
+    //    SetWindowFont(RebarHandle, ToolbarWindowFont, TRUE);
+    //}
+
+    if (ToolBarHandle)
+    {
+        SetWindowFont(ToolBarHandle, ToolbarWindowFont, TRUE);
+    }
+
+    if (SearchboxHandle)
+    {
+        SetWindowFont(SearchboxHandle, ToolbarWindowFont, TRUE);
+    }
+
+    if (StatusBarHandle)
+    {
+        SetWindowFont(StatusBarHandle, ToolbarWindowFont, TRUE);
+    }
+
+    ToolbarLoadSettings(TRUE);
+
+    // Update fonts/sizes for new DPI.
+    if (ToolBarHandle)
+    {
+        LONG toolbarButtonHeight;
+
+        USHORT toolbarButtonSize = HIWORD((ULONG)SendMessage(ToolBarHandle, TB_GETBUTTONSIZE, 0, 0));
+        toolbarButtonHeight = ToolStatusGetWindowFontSize(ToolBarHandle, ToolbarWindowFont);
+        toolbarButtonHeight = __max(toolbarButtonSize, toolbarButtonHeight);
+
+        if (toolbarButtonHeight < 22)
+            toolbarButtonHeight = 22; // 22/default toolbar button height
+
+        SendMessage(ToolBarHandle, TB_SETBUTTONSIZE, 0, MAKELPARAM(0, toolbarButtonHeight));
+        RebarAdjustBandHeightLayout(toolbarButtonHeight);
+    }
+
+    if (RebarHandle)
+    {
+        SendMessage(RebarHandle, WM_SIZE, 0, 0);
+    }
+
+    if (StatusBarHandle)
+    {
+        LONG statusbarButtonHeight;
+
+        statusbarButtonHeight = ToolStatusGetWindowFontSize(StatusBarHandle, ToolbarWindowFont);
+        statusbarButtonHeight = __max(23, statusbarButtonHeight); // 23/default statusbar height
+
+        SendMessage(StatusBarHandle, SB_SETMINHEIGHT, statusbarButtonHeight, 0);
+        SendMessage(StatusBarHandle, WM_SIZE, 0, 0); // redraw
+        StatusBarUpdate(TRUE);
+    }
+
+    ToolbarGraphsInitializeDpi();
+
+    InvalidateMainWindowLayout();
+}
+
+VOID UpdateLayoutMetrics(
+    VOID
+    )
+{
+    ToolbarWindowFont = SystemInformer_GetFont();
+
+    if (ToolBarHandle)
+    {
+        SetWindowFont(ToolBarHandle, ToolbarWindowFont, TRUE);
+    }
+
+    if (StatusBarHandle)
+    {
+        SetWindowFont(StatusBarHandle, ToolbarWindowFont, TRUE);
+    }
+
+    if (ToolBarHandle)
+    {
+        //ULONG toolbarButtonSize = (ULONG)SendMessage(ToolBarHandle, TB_GETBUTTONSIZE, 0, 0);
+        LONG toolbarButtonHeight = ToolStatusGetWindowFontSize(ToolBarHandle, ToolbarWindowFont);
+        toolbarButtonHeight = __max(22, toolbarButtonHeight); // 22/default toolbar button height
+
+        RebarAdjustBandHeightLayout(toolbarButtonHeight);
+        SendMessage(ToolBarHandle, TB_SETBUTTONSIZE, 0, MAKELPARAM(0, toolbarButtonHeight));
+    }
+
+    if (StatusBarHandle)
+    {
+        LONG statusbarButtonHeight = ToolStatusGetWindowFontSize(StatusBarHandle, ToolbarWindowFont);
+        statusbarButtonHeight = __max(23, statusbarButtonHeight); // 23/default statusbar height
+
+        SendMessage(StatusBarHandle, SB_SETMINHEIGHT, statusbarButtonHeight, 0);
+        //SendMessage(StatusBarHandle, WM_SIZE, 0, 0); // redraw
+        StatusBarUpdate(TRUE);
+    }
+
+    ToolbarLoadSettings(FALSE);
+}
+
+BOOLEAN NTAPI MessageLoopFilter(
+    _In_ PMSG Message,
+    _In_ PVOID Context
+    )
+{
+    if (
+        Message->hwnd == MainWindowHandle ||
+        Message->hwnd && IsChild(MainWindowHandle, Message->hwnd)
+        )
+    {
+#if TOOLSTATUS_ENABLE_MENUBAR
+        if (ToolStatusConfig.EnableMenuBar && MenuBarHandle)
+        {
+            LRESULT result;
+
+            if (ToolStatusMenuBarHandleMessage(MainWindowHandle, Message->message, Message->wParam, Message->lParam, &result))
+                return TRUE;
+        }
+#endif
+
+        if (TranslateAccelerator(MainWindowHandle, AcceleratorTable, Message))
+            return TRUE;
+
+        if (Message->message == WM_SYSCHAR && !ToolStatusConfig.EnableMenuBar && ToolStatusConfig.AutoHideMenu && !GetMenu(MainWindowHandle))
+        {
+            ULONG key = (ULONG)Message->wParam;
+
+            if (key == 'h' || key == 'v' || key == 't' || key == 'u' || key == 'e')
+            {
+                SetMenu(MainWindowHandle, MainMenu);
+                DrawMenuBar(MainWindowHandle);
+                SendMessage(MainWindowHandle, WM_SYSCHAR, Message->wParam, Message->lParam);
+                return TRUE;
+            }
+        }
+
+        if (Message->message == WM_KEYDOWN && Message->wParam == 'D' && (GetKeyState(VK_CONTROL) & 0x8000))
+        {
+            ShowFindDialog(MainWindowHandle);
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+static BOOLEAN NTAPI ToolStatusTargetingCallback(
+    _In_ HWND WindowHandle,
+    _In_opt_ PVOID Context
+    )
+{
+    UNREFERENCED_PARAMETER(Context);
+
+    return ToolStatusIsValidTargetWindow(WindowHandle, NULL);
+}
+
+static VOID ToolStatusHandleTargetingResult(
+    _In_ HWND WindowHandle,
+    _In_opt_ HWND TargetWindow,
+    _In_ ULONG TargetMode
+    )
+{
+    CLIENT_ID clientId;
+
+    if (!TargetWindow)
+        return;
+
+    if (ToolStatusConfig.ResolveGhostWindows)
+    {
+        HWND hungWindow = PhHungWindowFromGhostWindow(TargetWindow);
+
+        if (hungWindow)
+            TargetWindow = hungWindow;
+    }
+
+    if (ToolStatusIsValidTargetWindow(TargetWindow, &clientId))
+    {
+        PPH_PROCESS_NODE processNode;
+
+        if (SearchboxHandle)
+        {
+            // Clear search filters before selecting the process or the
+            // selected node won't be visible if it's filtered out. (dmex)
+            PhSearchControlClear(SearchboxHandle);
+        }
+
+        if (processNode = PhFindProcessNode(clientId.UniqueProcess))
+        {
+            SystemInformer_SelectTabPage(0);
+            //SystemInformer_ToggleVisible(FALSE);
+            SystemInformer_SelectProcessNode(processNode);
+        }
+
+        switch (TargetMode)
+        {
+        case TIDC_FINDWINDOWTHREAD:
+            {
+                PPH_PROCESS_PROPCONTEXT propContext;
+                PPH_PROCESS_ITEM processItem;
+
+                if (processItem = PhReferenceProcessItem(clientId.UniqueProcess))
+                {
+                    if (propContext = PhCreateProcessPropContext(WindowHandle, processItem))
+                    {
+                        PhSetSelectThreadIdProcessPropContext(propContext, clientId.UniqueThread);
+                        PhShowProcessProperties(propContext);
+                        PhDereferenceObject(propContext);
+                    }
+
+                    PhDereferenceObject(processItem);
+                }
+                else
+                {
+                    PhShowError2(WindowHandle, SystemInformer_GetWindowName(), L"The process (PID %lu) does not exist.", HandleToUlong(clientId.UniqueProcess));
+                }
+            }
+            break;
+        case TIDC_FINDWINDOWKILL:
+            {
+                PPH_PROCESS_ITEM processItem;
+
+                if (processItem = PhReferenceProcessItem(clientId.UniqueProcess))
+                {
+                    PhUiTerminateProcesses(WindowHandle, &processItem, 1);
+                    PhDereferenceObject(processItem);
+                }
+                else
+                {
+                    PhShowError2(WindowHandle, SystemInformer_GetWindowName(), L"The process (PID %lu) does not exist.", HandleToUlong(clientId.UniqueProcess));
+                }
+            }
+            break;
+        }
+    }
+}
+_Function_class_(PH_SEARCHCONTROL_CALLBACK)
+VOID NTAPI SearchControlCallback(
+    _In_ ULONG_PTR MatchHandle,
+    _In_opt_ PVOID Context
+    )
+{
+    SearchMatchHandle = MatchHandle;
+
+    if (SearchMatchHandle)
+    {
+        // Expand the nodes to ensure that they will be visible to the user.
+        PhExpandAllProcessNodes(TRUE);
+
+        PhDeselectAllProcessNodes();
+        PhDeselectAllServiceNodes();
+        PhDeselectAllNetworkNodes();
+
+        if (RestoreRowAfterSearch)
+        {
+            RestoreSearchTreeHandle = NULL;
+            RestoreSearchSelectedNode = NULL;
+        }
+    }
+    else
+    {
+        if (RestoreRowAfterSearch && (RestoreSearchTreeHandle = GetCurrentTreeNewHandle()))
+        {
+            RestoreSearchSelectedNode = TreeNew_GetSelectedNode(RestoreSearchTreeHandle);
+        }
+    }
+
+    PhApplyTreeNewFilters(PhGetFilterSupportProcessTreeList());
+    PhApplyTreeNewFilters(PhGetFilterSupportServiceTreeList());
+    PhApplyTreeNewFilters(PhGetFilterSupportNetworkTreeList());
+
+    PluginInterfaceInvokeSearchChangedEvent(SearchMatchHandle);
+
+    if (RestoreRowAfterSearch && RestoreSearchTreeHandle && RestoreSearchSelectedNode)
+    {
+        TreeNew_FocusMarkSelectNode(RestoreSearchTreeHandle, RestoreSearchSelectedNode);
+        TreeNew_EnsureVisible(RestoreSearchTreeHandle, RestoreSearchSelectedNode);
+    }
+}
+
+VOID SetSearchFocus(
+    _In_ HWND hWnd,
+    _In_ BOOLEAN Focus
+    )
+{
+    if (SearchboxHandle && ToolStatusConfig.SearchBoxEnabled)
+    {
+        if (Focus)
+        {
+            if (SearchBoxDisplayMode == SEARCHBOX_DISPLAY_MODE_HIDEINACTIVE)
+            {
+                if (!RebarBandExists(REBAR_BAND_ID_SEARCHBOX))
+                {
+                    SearchBoxUpdateRebarBand();
+                }
+
+                if (!IsWindowVisible(SearchboxHandle))
+                {
+                    ShowWindow(SearchboxHandle, SW_SHOW);
+                }
+            }
+
+            SetFocus(SearchboxHandle);
+            Edit_SetSel(SearchboxHandle, 0, -1);
+        }
+        else
+        {
+            HWND tnHandle;
+
+            // Return focus to the treelist.
+
+            if (tnHandle = GetCurrentTreeNewHandle())
+            {
+                // Select the first visible node.
+                TreeNew_SelectFirstVisibleNode(tnHandle);
+            }
+        }
+    }
+}
+
+VOID ToggleSearchFocus(
+    _In_ HWND hWnd
+    )
+{
+    // Check if the searchbox is already focused.
+    SetSearchFocus(hWnd, GetFocus() != SearchboxHandle);
+}
+
+LRESULT CALLBACK MainWindowCallbackProc(
+    _In_ HWND WindowHandle,
+    _In_ ULONG WindowMessage,
+    _In_ WPARAM wParam,
+    _In_ LPARAM lParam
+    )
+{
+#if TOOLSTATUS_ENABLE_MENUBAR
+    if (ToolStatusConfig.EnableMenuBar && MenuBarHandle)
+    {
+        LRESULT result;
+
+        if (ToolStatusMenuBarHandleMessage(WindowHandle, WindowMessage, wParam, lParam, &result))
+            return result;
+    }
+#endif
+
+    switch (WindowMessage)
+    {
+    case WM_NCCREATE:
+        {
+            MainWindowHandle = WindowHandle;
+        }
+        break;
+    case WM_DESTROY:
+        {
+            TaskbarMainWndExiting = TRUE;
+
+            if (TargetingContext)
+            {
+                PPH_WINDOW_TARGETING_CONTEXT targetingContext = TargetingContext;
+
+                TargetingContext = NULL;
+                PhDestroyWindowTargeting(targetingContext);
+            }
+
+            SystemInformer_SetWindowProcedure(MainWindowHookProc);
+            PhSetWindowProcedure(WindowHandle, MainWindowHookProc);
+        }
+        break;
+    case WM_ENDSESSION:
+        {
+            TaskbarMainWndExiting = TRUE;
+        }
+        break;
+    case WM_DPICHANGED:
+        {
+            // Let System Informer perform the default processing.
+            LRESULT result = MainWindowHookProc(WindowHandle, WindowMessage, wParam, lParam);
+
+            SystemInformer_Invoke(UpdateDpiMetrics, NULL);
+
+            return result;
+        }
+        break;
+    case WM_COMMAND:
+        {
+            switch (GET_WM_COMMAND_CMD(wParam, lParam))
+            {
+            case EN_SETFOCUS:
+                {
+                    if (!SearchboxHandle)
+                        break;
+
+                    if (GET_WM_COMMAND_HWND(wParam, lParam) != SearchboxHandle)
+                        break;
+
+                    if (RestoreRowAfterSearch)
+                    {
+                        PPH_PROCESS_ITEM processItem = PhGetSelectedProcessItem();
+
+                        if (processItem)
+                            RestoreSearchSelectedProcessId = HandleToUlong(processItem->ProcessId);
+                        else
+                            RestoreSearchSelectedProcessId = ULONG_MAX;
+                    }
+                }
+                break;
+            case EN_KILLFOCUS:
+                {
+                    if (!SearchboxHandle)
+                        break;
+
+                    if (GET_WM_COMMAND_HWND(wParam, lParam) != SearchboxHandle)
+                        break;
+
+                    if (RestoreRowAfterSearch && !SearchMatchHandle)
+                    {
+                        if (RestoreSearchSelectedProcessId != ULONG_MAX)
+                        {
+                            PPH_PROCESS_NODE node;
+
+                            if (node = PhFindProcessNode(UlongToHandle(RestoreSearchSelectedProcessId)))
+                            {
+                                SystemInformer_SelectTabPage(0);
+                                SystemInformer_SelectProcessNode(node);
+                            }
+
+                            RestoreSearchSelectedProcessId = ULONG_MAX;
+                        }
+                    }
+
+                    if (SearchBoxDisplayMode == SEARCHBOX_DISPLAY_MODE_HIDEINACTIVE && !SearchMatchHandle)
+                    {
+                        if (RebarBandExists(REBAR_BAND_ID_SEARCHBOX))
+                            RebarBandRemove(REBAR_BAND_ID_SEARCHBOX);
+                    }
+                }
+                goto DefaultWndProc;
+            }
+
+            switch (GET_WM_COMMAND_ID(wParam, lParam))
+            {
+            case PHAPP_ID_ESC_EXIT:
+                {
+                    // If we're targeting and the user presses the Esc key, cancel the targeting.
+                    // We also make sure the window doesn't get closed, by filtering out the message.
+                    if (TargetingContext)
+                    {
+                        ReleaseCapture();
+                        goto DefaultWndProc;
+                    }
+
+                    if (SearchboxHandle && (GetFocus() == SearchboxHandle))
+                    {
+                        SendMessage(SearchboxHandle, WM_KEYDOWN, VK_ESCAPE, 0);
+                        SetSearchFocus(WindowHandle, FALSE);
+
+                        goto DefaultWndProc;
+                    }
+                }
+                break;
+            case ID_SEARCH:
+                // handle keybind Ctrl + K
+                ToggleSearchFocus(WindowHandle);
+                goto DefaultWndProc;
+            case ID_SEARCH_TAB:
+                // handle tab when the searchbox is focused
+                if (SearchboxHandle && (GetFocus() == SearchboxHandle))
+                    SetSearchFocus(WindowHandle, FALSE);
+                goto DefaultWndProc;
+            case PHAPP_ID_VIEW_ALWAYSONTOP:
+                {
+                    // Let System Informer perform the default processing.
+                    LRESULT result = MainWindowHookProc(WindowHandle, WindowMessage, wParam, lParam);
+
+                    // Query the settings.
+                    BOOLEAN isAlwaysOnTopEnabled = !!PhGetIntegerSetting(SETTING_MAIN_WINDOW_ALWAYS_ON_TOP);
+
+                    // Set the pressed button state.
+                    SendMessage(ToolBarHandle, TB_PRESSBUTTON, (WPARAM)PHAPP_ID_VIEW_ALWAYSONTOP, (LPARAM)(MAKELONG(isAlwaysOnTopEnabled, 0)));
+
+                    return result;
+                }
+                break;
+            case PHAPP_ID_UPDATEINTERVAL_FAST:
+            case PHAPP_ID_UPDATEINTERVAL_NORMAL:
+            case PHAPP_ID_UPDATEINTERVAL_BELOWNORMAL:
+            case PHAPP_ID_UPDATEINTERVAL_SLOW:
+            case PHAPP_ID_UPDATEINTERVAL_VERYSLOW:
+                {
+                    // Let System Informer perform the default processing.
+                    LRESULT result = MainWindowHookProc(WindowHandle, WindowMessage, wParam, lParam);
+
+                    StatusBarUpdate(TRUE);
+
+                    return result;
+                }
+                break;
+            case PHAPP_ID_VIEW_UPDATEAUTOMATICALLY:
+                {
+                    UpdateAutomatically = !UpdateAutomatically;
+
+                    StatusBarUpdate(TRUE);
+                }
+                break;
+            }
+        }
+        break;
+    case WM_NOTIFY:
+        {
+            LPNMHDR hdr = (LPNMHDR)lParam;
+
+            if (RebarHandle && hdr->hwndFrom == RebarHandle)
+            {
+                switch (hdr->code)
+                {
+                case RBN_HEIGHTCHANGE:
+                    {
+                        // Note: RB_INSERTBAND sends RBN_HEIGHTCHANGE during initialization and we skip the first
+                        // InvalidateMainWindowLayout since we invalidate layout during initialization from ToolbarLoadSettings (dmex)
+                        if (ToolbarInitialized)
+                        {
+                            InvalidateMainWindowLayout();
+                        }
+                    }
+                    break;
+                case RBN_CHEVRONPUSHED:
+                    {
+                        LPNMREBARCHEVRON rebar = (LPNMREBARCHEVRON)lParam;
+                        ULONG index = 0;
+                        ULONG buttonCount = 0;
+                        RECT toolbarRect;
+                        PPH_EMENU menu;
+                        PPH_EMENU_ITEM selectedItem;
+
+                        if (!PhGetClientRect(ToolBarHandle, &toolbarRect))
+                            break;
+
+                        menu = PhCreateEMenu();
+                        buttonCount = (ULONG)SendMessage(ToolBarHandle, TB_BUTTONCOUNT, 0, 0);
+
+                        for (index = 0; index < buttonCount; index++)
+                        {
+                            RECT buttonRect;
+                            TBBUTTONINFO buttonInfo =
+                            {
+                                sizeof(TBBUTTONINFO),
+                                TBIF_BYINDEX | TBIF_STYLE | TBIF_COMMAND | TBIF_IMAGE
+                            };
+
+                            // Get the client coordinates of the button.
+                            if (SendMessage(ToolBarHandle, TB_GETITEMRECT, index, (LPARAM)&buttonRect) == 0)
+                                break;
+
+                            if (buttonRect.right <= toolbarRect.right)
+                                continue;
+
+                            // Get extended button information.
+                            if (SendMessage(ToolBarHandle, TB_GETBUTTONINFO, index, (LPARAM)&buttonInfo) == INT_ERROR)
+                                break;
+
+                            if (buttonInfo.fsStyle == BTNS_SEP)
+                            {
+                                // Add separators to menu.
+                                PhInsertEMenuItem(menu, PhCreateEMenuSeparator(), ULONG_MAX);
+                            }
+                            else
+                            {
+                                PPH_EMENU_ITEM menuItem;
+                                LONG dpiValue;
+
+                                dpiValue = SystemInformer_GetWindowDpi();
+
+                                // Add toolbar buttons to the context menu.
+                                menuItem = PhCreateEMenuItem(0, buttonInfo.idCommand, ToolbarGetText(buttonInfo.idCommand), NULL, NULL);
+
+                                // Add the button image to the context menu.
+                                menuItem->Flags |= PH_EMENU_BITMAP_OWNED;
+                                menuItem->Bitmap = ToolbarGetImage(buttonInfo.idCommand, dpiValue);
+
+                                switch (buttonInfo.idCommand)
+                                {
+                                case TIDC_FINDWINDOW:
+                                case TIDC_FINDWINDOWTHREAD:
+                                case TIDC_FINDWINDOWKILL:
+                                    {
+                                        // Note: These buttons are incompatible with the context menu window messages.
+                                        PhSetDisabledEMenuItem(menuItem);
+                                    }
+                                    break;
+                                case PHAPP_ID_VIEW_ALWAYSONTOP:
+                                    {
+                                        // Set the pressed state.
+                                        if (PhGetIntegerSetting(SETTING_MAIN_WINDOW_ALWAYS_ON_TOP))
+                                            menuItem->Flags |= PH_EMENU_CHECKED;
+                                    }
+                                    break;
+                                case PHAPP_ID_HACKER_SHOWDETAILSFORALLPROCESSES:
+                                    {
+                                        if (PhGetOwnTokenAttributes().Elevated)
+                                        {
+                                            // Disable the 'Show Details for All Processes' button when we're elevated.
+                                            PhSetDisabledEMenuItem(menuItem);
+                                        }
+                                    }
+                                    break;
+                                case TIDC_POWERMENUDROPDOWN:
+                                    {
+                                        // Create the sub-menu...
+                                        PhInsertEMenuItem(menuItem, PhCreateEMenuItem(0, PHAPP_ID_COMPUTER_LOCK, L"&Lock", NULL, NULL), ULONG_MAX);
+                                        PhInsertEMenuItem(menuItem, PhCreateEMenuItem(0, PHAPP_ID_COMPUTER_LOGOFF, L"Log o&ff", NULL, NULL), ULONG_MAX);
+                                        PhInsertEMenuItem(menuItem, PhCreateEMenuSeparator(), ULONG_MAX);
+                                        PhInsertEMenuItem(menuItem, PhCreateEMenuItem(0, PHAPP_ID_COMPUTER_SLEEP, L"&Sleep", NULL, NULL), ULONG_MAX);
+                                        PhInsertEMenuItem(menuItem, PhCreateEMenuItem(0, PHAPP_ID_COMPUTER_HIBERNATE, L"&Hibernate", NULL, NULL), ULONG_MAX);
+                                        PhInsertEMenuItem(menuItem, PhCreateEMenuSeparator(), ULONG_MAX);
+                                        PhInsertEMenuItem(menuItem, PhCreateEMenuItem(0, PHAPP_ID_COMPUTER_RESTART_UPDATE, L"Update and restart", NULL, NULL), ULONG_MAX);
+                                        PhInsertEMenuItem(menuItem, PhCreateEMenuItem(0, PHAPP_ID_COMPUTER_SHUTDOWN_UPDATE, L"Update and shut down", NULL, NULL), ULONG_MAX);
+                                        PhInsertEMenuItem(menuItem, PhCreateEMenuSeparator(), ULONG_MAX);
+                                        PhInsertEMenuItem(menuItem, PhCreateEMenuItem(0, PHAPP_ID_COMPUTER_RESTART, L"R&estart", NULL, NULL), ULONG_MAX);
+                                        PhInsertEMenuItem(menuItem, PhCreateEMenuItem(0, PHAPP_ID_COMPUTER_RESTARTADVOPTIONS, L"Restart to advanced options", NULL, NULL), ULONG_MAX);
+                                        PhInsertEMenuItem(menuItem, PhCreateEMenuItem(0, PHAPP_ID_COMPUTER_RESTARTBOOTOPTIONS, L"Restart to boot &options", NULL, NULL), ULONG_MAX);
+                                        PhInsertEMenuItem(menuItem, PhCreateEMenuItem(PhGetOwnTokenAttributes().Elevated ? 0 : PH_EMENU_DISABLED, PHAPP_ID_COMPUTER_RESTARTFWOPTIONS, L"Restart to firmware options", NULL, NULL), ULONG_MAX);
+                                        PhInsertEMenuItem(menuItem, PhCreateEMenuSeparator(), ULONG_MAX);
+                                        PhInsertEMenuItem(menuItem, PhCreateEMenuItem(0, PHAPP_ID_COMPUTER_SHUTDOWN, L"Shu&t down", NULL, NULL), ULONG_MAX);
+                                        PhInsertEMenuItem(menuItem, PhCreateEMenuItem(0, PHAPP_ID_COMPUTER_SHUTDOWNHYBRID, L"H&ybrid shut down", NULL, NULL), ULONG_MAX);
+
+                                        if (PhWindowsVersion < WINDOWS_8)
+                                        {
+                                            PPH_EMENU_ITEM menuItemRemove;
+
+                                            if (menuItemRemove = PhFindEMenuItem(menuItem, PH_EMENU_FIND_DESCEND, NULL, PHAPP_ID_COMPUTER_RESTARTBOOTOPTIONS))
+                                                PhDestroyEMenuItem(menuItemRemove);
+                                            if (menuItemRemove = PhFindEMenuItem(menuItem, PH_EMENU_FIND_DESCEND, NULL, PHAPP_ID_COMPUTER_SHUTDOWNHYBRID))
+                                                PhDestroyEMenuItem(menuItemRemove);
+                                        }
+                                    }
+                                    break;
+                                }
+
+                                PhInsertEMenuItem(menu, menuItem, ULONG_MAX);
+                            }
+                        }
+
+                        MapWindowRect(RebarHandle, HWND_DESKTOP, &rebar->rc);
+
+                        selectedItem = PhShowEMenu(
+                            menu,
+                            WindowHandle,
+                            PH_EMENU_SHOW_LEFTRIGHT,
+                            PH_ALIGN_LEFT | PH_ALIGN_TOP,
+                            rebar->rc.left,
+                            rebar->rc.bottom
+                            );
+
+                        if (selectedItem && selectedItem->Id != ULONG_MAX)
+                        {
+                            MainWindowHookProc(WindowHandle, WM_COMMAND, MAKEWPARAM(selectedItem->Id, BN_CLICKED), 0);
+                        }
+
+                        PhDestroyEMenu(menu);
+                    }
+                    break;
+                case RBN_LAYOUTCHANGED:
+                    {
+                        ReBarSaveLayoutSettings();
+                    }
+                    break;
+                case NM_CUSTOMDRAW:
+                    {
+                        if (EnableThemeSupport)
+                            return PhThemeWindowDrawRebar((LPNMCUSTOMDRAW)lParam);
+                    }
+                    break;
+                }
+
+                goto DefaultWndProc;
+            }
+#if TOOLSTATUS_ENABLE_MENUBAR
+            else if (ToolStatusConfig.EnableMenuBar && MenuBarHandle && hdr->hwndFrom == MenuBarHandle)
+            {
+                LRESULT result;
+
+                if (ToolStatusMenuBarHandleNotify(hdr, &result))
+                    return result;
+
+                goto DefaultWndProc;
+            }
+#endif
+            else if (ToolBarHandle && hdr->hwndFrom == ToolBarHandle)
+            {
+                switch (hdr->code)
+                {
+                case TBN_GETDISPINFO:
+                    {
+                        LPNMTBDISPINFO toolbarDisplayInfo = (LPNMTBDISPINFO)lParam;
+
+                        if (FlagOn(toolbarDisplayInfo->dwMask, TBNF_IMAGE))
+                        {
+                            // Try to find the cached bitmap index.
+                            // NOTE: The TBNF_DI_SETITEM flag below will cache the index so we only get called once.
+                            //       However, when adding buttons from the customize dialog we get called a second time,
+                            //       so we cache the index in our ToolbarButtons array to prevent ToolBarImageList from growing.
+                            for (ULONG i = 0; i < ARRAYSIZE(ToolbarButtons); i++)
+                            {
+                                if (ToolbarButtons[i].idCommand == toolbarDisplayInfo->idCommand)
+                                {
+                                    // Cache the bitmap index.
+                                    SetFlag(toolbarDisplayInfo->dwMask, TBNF_DI_SETITEM);
+                                    // Set the bitmap index.
+                                    toolbarDisplayInfo->iImage = ToolbarButtons[i].iBitmap;
+                                    break;
+                                }
+                            }
+
+                            if (toolbarDisplayInfo->iImage == I_IMAGECALLBACK)
+                            {
+                                LONG dpiValue = SystemInformer_GetWindowDpi();
+
+                                // We didn't find a cached bitmap index...
+                                // Load the button bitmap and cache the index.
+                                for (ULONG i = 0; i < ARRAYSIZE(ToolbarButtons); i++)
+                                {
+                                    if (ToolbarButtons[i].idCommand == toolbarDisplayInfo->idCommand)
+                                    {
+                                        HBITMAP buttonImage;
+
+                                        if (buttonImage = ToolbarGetImage(toolbarDisplayInfo->idCommand, dpiValue))
+                                        {
+                                            // Cache the bitmap index.
+                                            SetFlag(toolbarDisplayInfo->dwMask, TBNF_DI_SETITEM);
+
+                                            // Add the image, cache the value in the ToolbarButtons array, set the bitmap index.
+                                            toolbarDisplayInfo->iImage = ToolbarButtons[i].iBitmap = PhImageListAddBitmap(
+                                                ToolBarImageList,
+                                                buttonImage,
+                                                NULL
+                                                );
+
+                                            DeleteBitmap(buttonImage);
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    break;
+                case TBN_DROPDOWN:
+                    {
+                        LPNMTOOLBAR toolbar = (LPNMTOOLBAR)hdr;
+                        PPH_EMENU menu;
+                        PPH_EMENU_ITEM selectedItem;
+
+                        if (toolbar->iItem != TIDC_POWERMENUDROPDOWN)
+                            break;
+
+                        menu = PhCreateEMenu();
+                        PhInsertEMenuItem(menu, PhCreateEMenuItem(0, PHAPP_ID_COMPUTER_LOCK, L"&Lock", NULL, NULL), ULONG_MAX);
+                        PhInsertEMenuItem(menu, PhCreateEMenuItem(0, PHAPP_ID_COMPUTER_LOGOFF, L"Log o&ff", NULL, NULL), ULONG_MAX);
+                        PhInsertEMenuItem(menu, PhCreateEMenuSeparator(), ULONG_MAX);
+                        PhInsertEMenuItem(menu, PhCreateEMenuItem(0, PHAPP_ID_COMPUTER_SLEEP, L"&Sleep", NULL, NULL), ULONG_MAX);
+                        PhInsertEMenuItem(menu, PhCreateEMenuItem(0, PHAPP_ID_COMPUTER_HIBERNATE, L"&Hibernate", NULL, NULL), ULONG_MAX);
+                        PhInsertEMenuItem(menu, PhCreateEMenuSeparator(), ULONG_MAX);
+                        PhInsertEMenuItem(menu, PhCreateEMenuItem(0, PHAPP_ID_COMPUTER_RESTART_UPDATE, L"Update and restart", NULL, NULL), ULONG_MAX);
+                        PhInsertEMenuItem(menu, PhCreateEMenuItem(0, PHAPP_ID_COMPUTER_SHUTDOWN_UPDATE, L"Update and shut down", NULL, NULL), ULONG_MAX);
+                        PhInsertEMenuItem(menu, PhCreateEMenuSeparator(), ULONG_MAX);
+                        PhInsertEMenuItem(menu, PhCreateEMenuItem(0, PHAPP_ID_COMPUTER_RESTART, L"R&estart", NULL, NULL), ULONG_MAX);
+                        PhInsertEMenuItem(menu, PhCreateEMenuItem(0, PHAPP_ID_COMPUTER_RESTARTADVOPTIONS, L"Restart to advanced options", NULL, NULL), ULONG_MAX);
+                        PhInsertEMenuItem(menu, PhCreateEMenuItem(0, PHAPP_ID_COMPUTER_RESTARTBOOTOPTIONS, L"Restart to boot &options", NULL, NULL), ULONG_MAX);
+                        PhInsertEMenuItem(menu, PhCreateEMenuItem(PhGetOwnTokenAttributes().Elevated ? 0 : PH_EMENU_DISABLED, PHAPP_ID_COMPUTER_RESTARTFWOPTIONS, L"Restart to firmware options", NULL, NULL), ULONG_MAX);
+                        PhInsertEMenuItem(menu, PhCreateEMenuSeparator(), ULONG_MAX);
+                        PhInsertEMenuItem(menu, PhCreateEMenuItem(0, PHAPP_ID_COMPUTER_SHUTDOWN, L"Shu&t down", NULL, NULL), ULONG_MAX);
+                        PhInsertEMenuItem(menu, PhCreateEMenuItem(0, PHAPP_ID_COMPUTER_SHUTDOWNHYBRID, L"H&ybrid shut down", NULL, NULL), ULONG_MAX);
+
+                        if (PhWindowsVersion < WINDOWS_8)
+                        {
+                            PPH_EMENU_ITEM menuItemRemove;
+
+                            if (menuItemRemove = PhFindEMenuItem(menu, PH_EMENU_FIND_DESCEND, NULL, PHAPP_ID_COMPUTER_RESTARTBOOTOPTIONS))
+                                PhDestroyEMenuItem(menuItemRemove);
+                            if (menuItemRemove = PhFindEMenuItem(menu, PH_EMENU_FIND_DESCEND, NULL, PHAPP_ID_COMPUTER_SHUTDOWNHYBRID))
+                                PhDestroyEMenuItem(menuItemRemove);
+                        }
+
+                        MapWindowRect(ToolBarHandle, HWND_DESKTOP, &toolbar->rcButton);
+
+                        selectedItem = PhShowEMenu(
+                            menu,
+                            WindowHandle,
+                            PH_EMENU_SHOW_LEFTRIGHT,
+                            PH_ALIGN_LEFT | PH_ALIGN_TOP,
+                            toolbar->rcButton.left,
+                            toolbar->rcButton.bottom
+                            );
+
+                        if (selectedItem && selectedItem->Id != ULONG_MAX)
+                        {
+                            MainWindowHookProc(WindowHandle, WM_COMMAND, MAKEWPARAM(selectedItem->Id, BN_CLICKED), 0);
+                        }
+
+                        PhDestroyEMenu(menu);
+                    }
+                    return TBDDRET_DEFAULT;
+                case NM_LDOWN:
+                    {
+                        LPNMCLICK toolbar = (LPNMCLICK)hdr;
+                        ULONG id = (ULONG)toolbar->dwItemSpec;
+
+                        if (id == ULONG_MAX)
+                            break;
+
+                        if (id == TIDC_FINDWINDOW || id == TIDC_FINDWINDOWTHREAD || id == TIDC_FINDWINDOWKILL)
+                        {
+                            TargetingMode = id;
+
+                            if (ToolStatusConfig.FindWindowSnapshot)
+                            {
+                                HWND targetWindow = PhSelectWindowFromScreenSnapshot();
+
+                                ToolStatusHandleTargetingResult(WindowHandle, targetWindow, TargetingMode);
+                            }
+                            else if (!TargetingContext)
+                            {
+                                TargetingContext = PhCreateWindowTargeting(
+                                    WindowHandle,
+                                    !!ToolStatusConfig.FindWindowOverlayHighlight,
+                                    ToolStatusTargetingCallback,
+                                    NULL
+                                    );
+                            }
+                        }
+                    }
+                    break;
+                case NM_RCLICK:
+                    {
+                        ShowCustomizeMenu(WindowHandle);
+                    }
+                    break;
+                case NM_CUSTOMDRAW:
+                    {
+                        if (EnableThemeSupport)
+                            return PhThemeWindowDrawToolbar((LPNMTBCUSTOMDRAW)lParam);
+                    }
+                    break;
+                }
+
+                goto DefaultWndProc;
+            }
+            else if (StatusBarHandle && hdr->hwndFrom == StatusBarHandle)
+            {
+                switch (hdr->code)
+                {
+                case NM_RCLICK:
+                    {
+                        StatusBarShowMenu(WindowHandle);
+                    }
+                    break;
+                case NM_DBLCLK:
+                    {
+                        LPNMITEMACTIVATE nmItem = (LPNMITEMACTIVATE)lParam;
+                        LONG parts[MAX_STATUSBAR_ITEMS];
+                        LONG count;
+                        POINT cursorPos;
+
+                        if (nmItem->iItem < 0)
+                            break;
+
+                        if (!PhGetMessagePos(&cursorPos))
+                            break;
+
+                        count = (LONG)SendMessage(StatusBarHandle, SB_GETPARTS, (WPARAM)RTL_NUMBER_OF(parts), (LPARAM)parts);
+
+                        for (LONG i = 0; i < count; ++i)
+                        {
+                            RECT rect;
+
+                            if (i == 0)
+                                rect.left = 0;
+                            else
+                                rect.left = parts[i - 1];
+
+                            rect.right = parts[i];
+
+                            if (cursorPos.x >= rect.left && cursorPos.x < rect.right)
+                            {
+                                switch (PtrToUlong(StatusBarItemList->Items[i]))
+                                {
+                                case ID_STATUS_CPUUSAGE:
+                                    PhShowSystemInformationDialog(L"CPU");
+                                    break;
+                                case ID_STATUS_PHYSICALMEMORY:
+                                    PhShowSystemInformationDialog(L"Memory");
+                                    break;
+                                case ID_STATUS_IO_RO:
+                                case ID_STATUS_IO_W:
+                                    PhShowSystemInformationDialog(L"I/O");
+                                    break;
+                                }
+
+                                break;
+                            }
+                        }
+                    }
+                    break;
+                }
+
+                goto DefaultWndProc;
+            }
+        }
+        break;
+    case WM_MOUSEMOVE:
+        {
+            if (TargetingContext)
+            {
+                PhProcessWindowTargetingMessage(TargetingContext, WindowMessage, NULL);
+                goto DefaultWndProc;
+            }
+        }
+        break;
+    case WM_LBUTTONUP:
+        {
+            if (TargetingContext)
+            {
+                HWND targetWindow;
+
+                if (PhProcessWindowTargetingMessage(TargetingContext, WindowMessage, &targetWindow) == PhWindowTargetingCompleted)
+                {
+                    PPH_WINDOW_TARGETING_CONTEXT targetingContext = TargetingContext;
+
+                    TargetingContext = NULL;
+                    PhDestroyWindowTargeting(targetingContext);
+                    ToolStatusHandleTargetingResult(WindowHandle, targetWindow, TargetingMode);
+                }
+
+                goto DefaultWndProc;
+            }
+        }
+        break;
+    case WM_CAPTURECHANGED:
+        {
+            if (TargetingContext &&
+                PhProcessWindowTargetingMessage(TargetingContext, WindowMessage, NULL) == PhWindowTargetingCancelled)
+            {
+                PPH_WINDOW_TARGETING_CONTEXT targetingContext = TargetingContext;
+
+                TargetingContext = NULL;
+                PhDestroyWindowTargeting(targetingContext);
+            }
+        }
+        break;
+    case WM_SIZE:
+        {
+            // Invalidate plugin window layouts.
+            SystemInformer_InvalidateLayoutPadding();
+        }
+        break;
+    case WM_SETTINGCHANGE:
+        {
+            if (SearchboxHandle)
+            {
+                // Forward to the Searchbox so we can reinitialize the settings. (dmex)
+                SendMessage(SearchboxHandle, WM_SETTINGCHANGE, 0, 0);
+            }
+        }
+        break;
+    case WM_SHOWWINDOW:
+        {
+            UpdateGraphs = !!(BOOL)wParam;
+        }
+        break;
+    case WM_ENTERSIZEMOVE:
+        {
+            IsWindowSizeMove = TRUE;
+        }
+        break;
+    case WM_EXITSIZEMOVE:
+        {
+            IsWindowSizeMove = FALSE;
+        }
+        break;
+    case WM_WINDOWPOSCHANGED:
+        {
+            if (IsWindowSizeMove)
+                break;
+
+            // Note: The toolbar graphs sometimes stop updating after restoring
+            // the window because WindowsNT doesn't always send a SC_RESTORE message...
+            // The below code is an attempt at working around this issue. (dmex)
+
+            BOOLEAN minimized = !!IsMinimized(WindowHandle);
+            BOOLEAN maximized = !!IsMaximized(WindowHandle);
+
+            if (IsWindowMinimized != minimized)
+            {
+                IsWindowMinimized = minimized;
+                // Make sure graph drawing is enabled when not minimized. (dmex)
+                UpdateGraphs = !minimized;
+
+                if (UpdateGraphs && RebarHandle && ToolbarGraphsEnabled())// && CheckRebarLastRedrawMessage())
+                {
+                    // See notes in SC_RESTORE (dmex)
+                    ToolbarUpdateGraphVisualStates();
+                    SetWindowPos(RebarHandle, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOOWNERZORDER | SWP_NOSENDCHANGING);
+                }
+            }
+
+            if (IsWindowMaximized != maximized)
+            {
+                IsWindowMaximized = minimized;
+
+                if (UpdateGraphs && RebarHandle && ToolbarGraphsEnabled())// && CheckRebarLastRedrawMessage())
+                {
+                    // See notes in SC_RESTORE (dmex)
+                    ToolbarUpdateGraphVisualStates();
+                    SetWindowPos(RebarHandle, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOOWNERZORDER | SWP_NOSENDCHANGING);
+                }
+            }
+        }
+        break;
+    case WM_SYSCOMMAND:
+        {
+            ULONG command = (wParam & 0xFFF0);
+
+            switch (command)
+            {
+            case SC_KEYMENU:
+                {
+                    if (lParam != 0)
+                        break;
+
+                    if (ToolStatusConfig.EnableMenuBar)
+                        break;
+
+                    if (!ToolStatusConfig.AutoHideMenu)
+                        break;
+
+                    if (GetMenu(WindowHandle))
+                    {
+                        SetMenu(WindowHandle, NULL);
+                    }
+                    else
+                    {
+                        SetMenu(WindowHandle, MainMenu);
+                        DrawMenuBar(WindowHandle);
+                    }
+                }
+                break;
+            case SC_MINIMIZE:
+                {
+                    UpdateGraphs = FALSE;
+                }
+                break;
+            case SC_RESTORE:
+                {
+                    UpdateGraphs = TRUE;
+
+                    //if (RebarHandle && CheckRebarLastRedrawMessage())
+                    //{
+                    //    ToolbarUpdateGraphVisualStates();
+                    //
+                    //    // NOTE: Maximizing and restoring the window when updating is paused will cause the graphs to leave
+                    //    // artifacts on the window because the rebar control doesn't redraw... so we'll force the rebar to redraw.
+                    //    // TODO: Figure out the exact SetWindowPos flags required. (dmex)
+                    //    SetWindowPos(RebarHandle, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOOWNERZORDER | SWP_NOSENDCHANGING);
+                    //    //RedrawWindow(hWnd, NULL, NULL, RDW_ERASE | RDW_INVALIDATE | RDW_FRAME | RDW_ALLCHILDREN);
+                    //}
+                }
+                break;
+            }
+        }
+        break;
+    case WM_EXITMENULOOP:
+        {
+            if (ToolStatusConfig.EnableMenuBar)
+                break;
+
+            if (!ToolStatusConfig.AutoHideMenu)
+                break;
+
+            if (GetMenu(WindowHandle))
+            {
+                SetMenu(WindowHandle, NULL);
+            }
+        }
+        break;
+    case WM_PH_NOTIFY_ICON_MESSAGE:
+        {
+            // Don't do anything when search autofocus disabled.
+            if (!ToolStatusConfig.SearchAutoFocus)
+                break;
+
+            // Let System Informer perform the default processing.
+            LRESULT result = MainWindowHookProc(WindowHandle, WindowMessage, wParam, lParam);
+
+            // This fixes the search focus for the 'Hide when closed' option. See GH #663 (dmex)
+            switch (LOWORD(lParam))
+            {
+            case WM_LBUTTONDOWN:
+                {
+                    if (SearchboxHandle && IconSingleClick)
+                    {
+                        if (IsWindowVisible(WindowHandle))
+                        {
+                            SetFocus(SearchboxHandle);
+                        }
+                    }
+                }
+                break;
+            case WM_LBUTTONDBLCLK:
+                {
+                    if (SearchboxHandle && !IconSingleClick)
+                    {
+                        if (IsWindowVisible(WindowHandle))
+                        {
+                            SetFocus(SearchboxHandle);
+                        }
+                    }
+                }
+                break;
+            }
+
+            return result;
+        }
+        break;
+    case WM_PH_ACTIVATE:
+        {
+            // Don't do anything when search autofocus disabled. (dmex)
+            if (!ToolStatusConfig.SearchAutoFocus)
+                break;
+
+            // Let System Informer perform the default processing. (dmex)
+            LRESULT result = MainWindowHookProc(WindowHandle, WindowMessage, wParam, lParam);
+
+            // Re-focus the searchbox when we're already running and we're moved
+            // into the foreground by the new instance. Fixes GH #178 (dmex)
+            if (SearchboxHandle && result == PH_ACTIVATE_REPLY)
+            {
+                if (IsWindowVisible(WindowHandle))
+                {
+                    SetFocus(SearchboxHandle);
+                }
+            }
+
+            return result;
+        }
+        break;
+    default:
+        if (FindDialogMessage != ULONG_MAX && WindowMessage == FindDialogMessage)
+        {
+            FindDialogHandleFindMessage(lParam);
+        }
+        break;
+    }
+
+    return MainWindowHookProc(WindowHandle, WindowMessage, wParam, lParam);
+DefaultWndProc:
+    return DefWindowProc(WindowHandle, WindowMessage, wParam, lParam);
+}
+
+_Function_class_(PH_CALLBACK_FUNCTION)
+VOID NTAPI MainWindowShowingCallback(
+    _In_opt_ PVOID Parameter,
+    _In_opt_ PVOID Context
+    )
+{
+    MainMenu = GetMenu(MainWindowHandle);
+
+    AcceleratorTable = LoadAccelerators(PluginInstance->DllBase, MAKEINTRESOURCE(IDR_MAINWND_ACCEL));
+    PhRegisterMessageLoopFilter(MessageLoopFilter, NULL);
+
+    PhRegisterCallback(
+        SystemInformer_GetCallbackLayoutPadding(),
+        LayoutPaddingCallback,
+        NULL,
+        &LayoutPaddingCallbackRegistration
+        );
+
+    ToolbarLoadSettings(FALSE);
+    ToolbarCreateGraphs();
+    ReBarLoadLayoutSettings();
+    StatusBarLoadSettings();
+    TaskbarInitialize();
+
+    ToolStatusApplyMainMenuVisibility(MainWindowHandle);
+
+    if (ToolStatusConfig.SearchBoxEnabled && ToolStatusConfig.SearchAutoFocus && SearchboxHandle)
+    {
+        SetFocus(SearchboxHandle);
+    }
+}
+
+_Function_class_(PH_CALLBACK_FUNCTION)
+VOID NTAPI MainMenuInitializingCallback(
+    _In_ PVOID Parameter,
+    _In_opt_ PVOID Context
+    )
+{
+    PPH_PLUGIN_MENU_INFORMATION menuInfo = Parameter;
+    ULONG insertIndex;
+    PPH_EMENU_ITEM menu;
+    PPH_EMENU_ITEM menuItem;
+    PPH_EMENU_ITEM mainMenuItem;
+    PPH_EMENU_ITEM searchMenuItem;
+#if TOOLSTATUS_ENABLE_MENUBAR
+    //PPH_EMENU_ITEM menuBarMenuItem;
+#endif
+    PPH_EMENU_ITEM lockMenuItem;
+
+    if (menuInfo->u.MainMenu.SubMenuIndex != PH_MENU_ITEM_LOCATION_VIEW)
+        return;
+
+    if (menuItem = PhFindEMenuItem(menuInfo->Menu, 0, NULL, PHAPP_ID_VIEW_TRAYICONS))
+        insertIndex = PhIndexOfEMenuItem(menuInfo->Menu, menuItem) + 1;
+    else
+        insertIndex = ULONG_MAX;
+
+    menu = PhPluginCreateEMenuItem(PluginInstance, 0, 0, L"Toolbar", NULL);
+    PhInsertEMenuItem(menu, mainMenuItem = PhPluginCreateEMenuItem(PluginInstance, 0, COMMAND_ID_ENABLE_MENU, L"Main menu (auto-hide)", NULL), ULONG_MAX);
+    PhInsertEMenuItem(menu, searchMenuItem = PhPluginCreateEMenuItem(PluginInstance, 0, COMMAND_ID_ENABLE_SEARCHBOX, L"Search box", NULL), ULONG_MAX);
+#if TOOLSTATUS_ENABLE_MENUBAR
+    //PhInsertEMenuItem(menu, menuBarMenuItem = PhPluginCreateEMenuItem(PluginInstance, 0, COMMAND_ID_ENABLE_MENUBAR, L"Menu bar", NULL), ULONG_MAX);
+#endif
+    PhInsertEMenuItem(menu, PhCreateEMenuSeparator(), ULONG_MAX);
+    ToolbarGraphCreatePluginMenu(menu, COMMAND_ID_GRAPHS_CUSTOMIZE);
+    PhInsertEMenuItem(menu, PhCreateEMenuSeparator(), ULONG_MAX);
+    PhInsertEMenuItem(menu, lockMenuItem = PhPluginCreateEMenuItem(PluginInstance, 0, COMMAND_ID_TOOLBAR_LOCKUNLOCK, L"Lock the toolbar", NULL), ULONG_MAX);
+    PhInsertEMenuItem(menu, PhPluginCreateEMenuItem(PluginInstance, 0, COMMAND_ID_TOOLBAR_CUSTOMIZE, L"Customize...", NULL), ULONG_MAX);
+
+    if (ToolStatusConfig.AutoHideMenu)
+        mainMenuItem->Flags |= PH_EMENU_CHECKED;
+    if (ToolStatusConfig.SearchBoxEnabled)
+        searchMenuItem->Flags |= PH_EMENU_CHECKED;
+#if TOOLSTATUS_ENABLE_MENUBAR
+    //if (ToolStatusConfig.EnableMenuBar)
+    //    menuBarMenuItem->Flags |= PH_EMENU_CHECKED;
+#endif
+    if (ToolStatusConfig.ToolBarLocked)
+        lockMenuItem->Flags |= PH_EMENU_CHECKED;
+
+    PhInsertEMenuItem(menuInfo->Menu, menu, insertIndex);
+}
+
+VOID UpdateCachedSettings(
+    VOID
+    )
+{
+    IconSingleClick = !!PhGetIntegerSetting(SETTING_ICON_SINGLE_CLICK);
+    EnableAvxSupport = !!PhGetIntegerSetting(SETTING_ENABLE_AVX_SUPPORT);
+    EnableGraphMaxScale = !!PhGetIntegerSetting(SETTING_ENABLE_GRAPH_MAX_SCALE);
+
+    if (ToolbarInitialized)
+    {
+        SystemInformer_Invoke(UpdateDpiMetrics, NULL);
+    }
+}
+
+_Function_class_(PH_CALLBACK_FUNCTION)
+VOID NTAPI LoadCallback(
+    _In_opt_ PVOID Parameter,
+    _In_opt_ PVOID Context
+    )
+{
+    ToolStatusConfig.Flags = PhGetIntegerSetting(SETTING_NAME_TOOLSTATUS_CONFIG);
+    DisplayStyle = PhGetIntegerSetting(SETTING_NAME_TOOLBARDISPLAYSTYLE);
+    SearchBoxDisplayMode = PhGetIntegerSetting(SETTING_NAME_SEARCHBOXDISPLAYMODE);
+    TaskbarListIconType = PhGetIntegerSetting(SETTING_NAME_TASKBARDISPLAYSTYLE);
+    RestoreRowAfterSearch = !!PhGetIntegerSetting(SETTING_NAME_RESTOREROWAFTERSEARCH);
+    EnableThemeSupport = !!PhGetIntegerSetting(SETTING_ENABLE_THEME_SUPPORT);
+    UpdateGraphs = !PhGetIntegerSetting(SETTING_START_HIDDEN);
+
+    // Note: The initialization delay improves performance during application
+    // launch and was made configurable per feature request. (dmex)
+    MaxInitializationDelay = PhGetIntegerSetting(SETTING_NAME_DELAYED_INITIALIZATION_MAX);
+    MaxInitializationDelay = __max(0, __min(MaxInitializationDelay, 5));
+
+    PluginInterfaceInitialize();
+
+    MainWindowHookProc = SystemInformer_GetWindowProcedure();
+    SystemInformer_SetWindowProcedure(MainWindowCallbackProc);
+
+    UpdateCachedSettings();
+
+    ToolbarGraphsInitialize();
+}
+
+_Function_class_(PH_CALLBACK_FUNCTION)
+VOID NTAPI SettingsUpdatedCallback(
+    _In_opt_ PVOID Parameter,
+    _In_opt_ PVOID Context
+    )
+{
+    UpdateCachedSettings();
+
+    if (MainWindowHandle)
+    {
+#if TOOLSTATUS_ENABLE_MENUBAR
+        if (MenuBarHandle)
+        {
+            PhInitializeWindowThemeMainMenu(MainMenu);
+            MenuBarApplySettings();
+        }
+#endif
+        if (StatusBarHandle)
+        {
+            SendMessage(StatusBarHandle, WM_THEMECHANGED, 0, 0);
+            InvalidateRect(StatusBarHandle, NULL, TRUE);
+            UpdateWindow(StatusBarHandle);
+        }
+    }
+}
+
+_Function_class_(PH_CALLBACK_FUNCTION)
+VOID NTAPI MenuItemCallback(
+    _In_opt_ PVOID Parameter,
+    _In_opt_ PVOID Context
+    )
+{
+    PPH_PLUGIN_MENU_ITEM menuItem = (PPH_PLUGIN_MENU_ITEM)Parameter;
+
+    if (menuItem && menuItem->Id != ULONG_MAX)
+    {
+        switch (menuItem->Id)
+        {
+        case COMMAND_ID_ENABLE_MENU:
+            {
+                ToolStatusConfig.AutoHideMenu = !ToolStatusConfig.AutoHideMenu;
+
+                PhSetIntegerSetting(SETTING_NAME_TOOLSTATUS_CONFIG, ToolStatusConfig.Flags);
+
+                if (ToolStatusConfig.AutoHideMenu)
+                {
+                    SetMenu(menuItem->OwnerWindow, NULL);
+                }
+                else
+                {
+                    SetMenu(menuItem->OwnerWindow, MainMenu);
+                    DrawMenuBar(menuItem->OwnerWindow);
+                }
+            }
+            break;
+        case COMMAND_ID_ENABLE_SEARCHBOX:
+            {
+                ToolStatusConfig.SearchBoxEnabled = !ToolStatusConfig.SearchBoxEnabled;
+
+                PhSetIntegerSetting(SETTING_NAME_TOOLSTATUS_CONFIG, ToolStatusConfig.Flags);
+
+                ToolbarLoadSettings(FALSE);
+                ReBarSaveLayoutSettings();
+
+                if (ToolStatusConfig.SearchBoxEnabled)
+                {
+                    // Adding the Searchbox makes it focused,
+                    // reset the focus back to the main window.
+                    SetFocus(menuItem->OwnerWindow);
+                }
+            }
+            break;
+#if TOOLSTATUS_ENABLE_MENUBAR
+        case COMMAND_ID_ENABLE_MENUBAR:
+            ToggleMenuBar(menuItem->OwnerWindow);
+            break;
+#endif
+        case COMMAND_ID_TOOLBAR_LOCKUNLOCK:
+            {
+                ULONG bandCount;
+                ULONG bandIndex;
+
+                if (RebarGetBandCount(&bandCount))
+                {
+                    for (bandIndex = 0; bandIndex < bandCount; bandIndex++)
+                    {
+                        ULONG rebarBandStyle;
+
+                        if (!RebarGetBandIndexStyle(bandIndex, &rebarBandStyle))
+                            continue;
+
+                        // Add then remove the RBBS_GRIPPERALWAYS style from the Rebar control to remove
+                        // window padding that is left behind after removing the RBBS_NOGRIPPER style. (dmex)
+
+                        if (!FlagOn(rebarBandStyle, RBBS_GRIPPERALWAYS))
+                        {
+                            SetFlag(rebarBandStyle, RBBS_GRIPPERALWAYS);
+                            RebarSetBandIndexStyle(bandIndex, rebarBandStyle);
+                            ClearFlag(rebarBandStyle, RBBS_GRIPPERALWAYS);
+                        }
+
+                        if (FlagOn(rebarBandStyle, RBBS_NOGRIPPER))
+                            ClearFlag(rebarBandStyle, RBBS_NOGRIPPER);
+                        else
+                            SetFlag(rebarBandStyle, RBBS_NOGRIPPER);
+
+                        RebarSetBandIndexStyle(bandIndex, rebarBandStyle);
+                    }
+                }
+
+                ToolStatusConfig.ToolBarLocked = !ToolStatusConfig.ToolBarLocked;
+
+                PhSetIntegerSetting(SETTING_NAME_TOOLSTATUS_CONFIG, ToolStatusConfig.Flags);
+
+                ToolbarLoadSettings(FALSE);
+            }
+            break;
+        case COMMAND_ID_TOOLBAR_CUSTOMIZE:
+            {
+                ToolBarShowCustomizeDialog(menuItem->OwnerWindow);
+            }
+            break;
+        case COMMAND_ID_GRAPHS_CUSTOMIZE:
+            {
+                ToolbarUpdateVisibleGraph(menuItem->Context);
+            }
+            break;
+        }
+    }
+}
+
+_Function_class_(PH_CALLBACK_FUNCTION)
+VOID NTAPI ShowOptionsCallback(
+    _In_ PVOID Parameter,
+    _In_ PVOID Context
+    )
+{
+    PPH_PLUGIN_OPTIONS_POINTERS optionsEntry = (PPH_PLUGIN_OPTIONS_POINTERS)Parameter;
+
+    optionsEntry->CreateSection(
+        L"ToolStatus",
+        PluginInstance->DllBase,
+        MAKEINTRESOURCE(IDD_OPTIONS),
+        OptionsDlgProc,
+        NULL
+        );
+}
+
+LOGICAL DllMain(
+    _In_ HINSTANCE Instance,
+    _In_ ULONG Reason,
+    _Reserved_ PVOID Reserved
+    )
+{
+    switch (Reason)
+    {
+    case DLL_PROCESS_ATTACH:
+        {
+            PPH_PLUGIN_INFORMATION info;
+            PH_SETTING_CREATE settings[] =
+            {
+                { IntegerSettingType, SETTING_NAME_TOOLSTATUS_CONFIG, L"3F" },
+                { IntegerSettingType, SETTING_NAME_TOOLBARDISPLAYSTYLE, L"1" },
+                { IntegerSettingType, SETTING_NAME_SEARCHBOXDISPLAYMODE, L"0" },
+                { IntegerSettingType, SETTING_NAME_TASKBARDISPLAYSTYLE, L"0" },
+                { IntegerSettingType, SETTING_NAME_SHOWSYSINFOGRAPH, L"1" },
+                { IntegerSettingType, SETTING_NAME_DELAYED_INITIALIZATION_MAX, L"3" },
+                { StringSettingType, SETTING_NAME_REBAR_CONFIG, L"" },
+#if TOOLSTATUS_ENABLE_MENUBAR
+                { StringSettingType, SETTING_NAME_REBAR_MENUBAR_CONFIG, L"" },
+#endif
+                { StringSettingType, SETTING_NAME_TOOLBAR_CONFIG, L"" },
+                { StringSettingType, SETTING_NAME_STATUSBAR_CONFIG, L"" },
+                { StringSettingType, SETTING_NAME_TOOLBAR_GRAPH_CONFIG, L"" },
+                { IntegerSettingType, SETTING_NAME_RESTOREROWAFTERSEARCH, L"1" },
+            };
+
+            WPP_INIT_TRACING(PLUGIN_NAME);
+
+            PluginInstance = PhRegisterPlugin(PLUGIN_NAME, Instance, &info);
+
+            if (!PluginInstance)
+                return FALSE;
+
+            info->DisplayName = L"Toolbar and Status Bar";
+            info->Description = L"Adds a Toolbar, Status Bar and Search box.";
+            info->Interface = (PVOID)&PluginInterface;
+
+            PhRegisterCallback(
+                PhGetPluginCallback(PluginInstance, PluginCallbackLoad),
+                LoadCallback,
+                NULL,
+                &PluginLoadCallbackRegistration
+                );
+            PhRegisterCallback(
+                PhGetPluginCallback(PluginInstance, PluginCallbackMenuItem),
+                MenuItemCallback,
+                NULL,
+                &PluginMenuItemCallbackRegistration
+                );
+            PhRegisterCallback(
+                PhGetGeneralCallback(GeneralCallbackMainWindowShowing),
+                MainWindowShowingCallback,
+                NULL,
+                &MainWindowShowingCallbackRegistration
+                );
+            PhRegisterCallback(
+                PhGetGeneralCallback(GeneralCallbackMainMenuInitializing),
+                MainMenuInitializingCallback,
+                NULL,
+                &MainMenuInitializingCallbackRegistration
+                );
+            PhRegisterCallback(
+                PhGetGeneralCallback(GeneralCallbackOptionsWindowInitializing),
+                ShowOptionsCallback,
+                NULL,
+                &PluginShowOptionsCallbackRegistration
+                );
+            PhRegisterCallback(
+                PhGetGeneralCallback(GeneralCallbackSettingsUpdated),
+                SettingsUpdatedCallback,
+                NULL,
+                &SettingsUpdatedCallbackRegistration
+                );
+            PhRegisterCallback(
+                PhGetGeneralCallback(GeneralCallbackProcessesUpdated),
+                ProcessesUpdatedCallback,
+                NULL,
+                &ProcessesUpdatedCallbackRegistration
+                );
+            PhRegisterCallback(
+                PhGetGeneralCallback(GeneralCallbackMainWindowTabChanged),
+                TabPageUpdatedCallback,
+                NULL,
+                &TabPageCallbackRegistration
+                );
+            PhRegisterCallback(
+                PhGetGeneralCallback(GeneralCallbackProcessTreeNewInitializing),
+                TreeNewInitializingCallback,
+                &ProcessTreeNewHandle,
+                &ProcessTreeNewInitializingCallbackRegistration
+                );
+            PhRegisterCallback(
+                PhGetGeneralCallback(GeneralCallbackServiceTreeNewInitializing),
+                TreeNewInitializingCallback,
+                &ServiceTreeNewHandle,
+                &ServiceTreeNewInitializingCallbackRegistration
+                );
+            PhRegisterCallback(
+                PhGetGeneralCallback(GeneralCallbackNetworkTreeNewInitializing),
+                TreeNewInitializingCallback,
+                &NetworkTreeNewHandle,
+                &NetworkTreeNewInitializingCallbackRegistration
+                );
+
+            PhAddSettings(settings, RTL_NUMBER_OF(settings));
+        }
+        break;
+    }
+
+    return TRUE;
+}

@@ -1,0 +1,6 @@
+#
+# Build trigger file
+#
+
+# This file was updated to trigger the CMake build workflow
+# The build should now start automatically on GitHub Actions
