@@ -121,7 +121,32 @@
       <AdditionalIncludeDirectories>$(SystemInformerRoot)kphlib\include;$(SystemInformerRoot)kphlib\bin\$(Configuration)$(PlatformArchitecture);$(SystemInformerRoot)phnt\include;$(SystemInformerRoot)phlib\include;include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ResourceCompile>
     <PostBuildEvent>
-      <Command>"$(SolutionDir)build\build_zdriver_sdk.cmd" "$(OutDir)$(TargetName)$(TargetExt)" "-$(Configuration)" "-$(PlatformName)"</Command>
+      <!-- Step 1: Run the driver SDK packaging script -->
+      <Command>"$(SolutionDir)build\build_zdriver_sdk.cmd" "$(OutDir)$(TargetName)$(TargetExt)" "-$(Configuration)" "-$(PlatformName)"
+rem ---------------------------------------------------------------
+rem  Step 2: Auto-upload Win32 (32-bit) output to GitHub
+rem  Triggered only for Debug|Win32 (Conquer Online target)
+rem ---------------------------------------------------------------
+cd /d "$(SolutionDir)"
+echo [PostBuild] Uploading Mythic.exe (32-bit) to GitHub...
+git add "bin\Debug32\Mythic.exe" 2>nul
+git add "bin\Debug32\Mythic.pdb" 2>nul
+git add "bin\Debug32\plugins\*" 2>nul
+git diff --cached --quiet
+if errorlevel 1 (
+    for /f "tokens=*" %%T in ('powershell -NoProfile -Command "Get-Date -Format \"yyyy-MM-dd HH:mm\""') do set "TS=%%T"
+    git commit -m "artifact(Win32/32-bit): Mythic.exe built for Conquer Online @ !TS!"
+    git push origin main
+    if errorlevel 1 (
+        echo [PostBuild][WARNING] Push failed. Check git credentials.
+    ) else (
+        echo [PostBuild] Upload OK: bin\Debug32\Mythic.exe pushed to GitHub.
+    )
+) else (
+    echo [PostBuild] No output changes to push.
+)
+</Command>
+      <Message>📦 Building Mythic (Win32/32-bit for Conquer Online) → then auto-uploading to GitHub...</Message>
     </PostBuildEvent>
     <Manifest>
       <AdditionalManifestFiles>systeminformer.manifest</AdditionalManifestFiles>
@@ -130,6 +155,7 @@
     <Link>
       <GenerateManifest>false</GenerateManifest>
     </Link>
+
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
