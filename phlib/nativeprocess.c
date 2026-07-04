@@ -11,8 +11,17 @@
  */
 
 #include <ph.h>
-#include <winternl.h>
 #include <kphuser.h>
+
+// ===== تعريف الدالة RtlLookupPrivilegeValue (بدون winternl.h) =====
+// هذه الدالة موجودة في ntdll.dll
+NTSTATUS NTAPI RtlLookupPrivilegeValue(
+    _In_opt_ PCWSTR lpSystemName,
+    _In_ PCWSTR lpName,
+    _Out_ PLUID lpLuid
+);
+// ===================================================================
+
 
 
 // ===== تمت الإضافة بواسطة سكربت الإصلاح التلقائي =====
