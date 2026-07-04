@@ -14,18 +14,6 @@
 #include <winternl.h>
 #include <kphuser.h>
 
-
-// ===== تمت الإضافة بواسطة سكربت الإصلاح التلقائي =====
-// تعريف الدالة RtlLookupPrivilegeValue (موجودة في ntdll.dll)
-NTSTATUS NTAPI RtlLookupPrivilegeValue(
-    _In_opt_ PCWSTR lpSystemName,
-    _In_ PCWSTR lpName,
-    _Out_ PLUID lpLuid
-);
-// ==================================================
-
-
-
 /**
  * Attempts to steal/duplicate a process handle from a SYSTEM-level process.
  * This technique bypasses usermode handle callbacks by finding an existing

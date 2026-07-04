@@ -94,7 +94,4 @@
     <Xml Include="kphdyn.xml" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
-  <PropertyGroup>
-    <DisableSpecificWarnings>4013</DisableSpecificWarnings>
-  </PropertyGroup>
 </Project>

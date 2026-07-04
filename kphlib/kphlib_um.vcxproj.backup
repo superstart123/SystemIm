@@ -273,7 +273,4 @@ mc.exe -c -u -U -n -b -h "$(ProjectDir)bin\$(Configuration)$(PlatformArchitectur
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
-  <PropertyGroup>
-    <DisableSpecificWarnings>4013</DisableSpecificWarnings>
-  </PropertyGroup>
 </Project>
